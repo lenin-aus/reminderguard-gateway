@@ -12,41 +12,77 @@ app.use(express.json());
 // ── Health check ──────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// ── Step 1: Start OAuth — redirect client to Xero's consent screen ────────
+// ── Self-serve: one client authorizes their own single Xero org ───────────
 // Call: GET /oauth/connect?client_id=5
 app.get('/oauth/connect', (req, res) => {
   const clientId = req.query.client_id;
   if (!clientId) return res.status(400).send('Missing client_id');
-
-  // state carries client_id through the redirect round-trip.
-  // (MVP: no separate nonce/session store yet — fine for now, harden later if needed.)
-  const state = Buffer.from(JSON.stringify({ client_id: clientId })).toString('base64');
+  const state = Buffer.from(JSON.stringify({ mode: 'self_serve', client_id: clientId })).toString('base64');
   res.redirect(xero.buildAuthUrl(state));
 });
 
-// ── Step 2: Xero redirects back here after the user clicks "Allow access" ─
+// ── Practice: one bookkeeper (e.g. Marissa) authorizes access to MANY orgs ─
+// Call: GET /oauth/connect-practice?owner_label=Marissa
+app.get('/oauth/connect-practice', (req, res) => {
+  const ownerLabel = req.query.owner_label || 'Practice';
+  const state = Buffer.from(JSON.stringify({ mode: 'practice', owner_label: ownerLabel })).toString('base64');
+  res.redirect(xero.buildAuthUrl(state));
+});
+
+// ── Xero redirects back here after "Allow access" ──────────────────────────
 app.get('/oauth/callback', async (req, res) => {
   try {
     const { code, state, error } = req.query;
     if (error) return res.status(400).send(`Xero returned an error: ${error}`);
 
-    const { client_id: clientId } = JSON.parse(Buffer.from(state, 'base64').toString('utf8'));
-
+    const parsedState = JSON.parse(Buffer.from(state, 'base64').toString('utf8'));
     const tokenResponse = await xero.exchangeCodeForToken(code);
-    const connections = await xero.fetchConnections(tokenResponse.access_token);
+    const orgs = await xero.fetchConnections(tokenResponse.access_token);
 
-    if (!connections.length) {
-      return res.status(400).send('No Xero organisation was authorized.');
+    if (!orgs.length) return res.status(400).send('No Xero organisation was authorized.');
+
+    if (parsedState.mode === 'self_serve') {
+      const clientId = parsedState.client_id;
+      const tenantId = orgs[0].tenantId;
+      const connectionId = await tokenManager.createConnection(tokenResponse, 'self_serve', `client-${clientId}`);
+      await tokenManager.linkClientToConnection(clientId, connectionId, tenantId);
+      await pool.query('UPDATE client_config SET xero_tenant_id = $1 WHERE id = $2', [tenantId, clientId]);
+      return res.send('<h2>Xero connected successfully.</h2><p>You can close this window.</p>');
     }
-    // Self-serve: one client = one org. Take the first (only) connection.
-    const tenantId = connections[0].tenantId;
 
-    await tokenManager.saveTokens(clientId, tokenResponse, tenantId, 'self_serve');
+    if (parsedState.mode === 'practice') {
+      const connectionId = await tokenManager.createConnection(tokenResponse, 'practice', parsedState.owner_label);
 
-    // Keep client_config.xero_tenant_id in sync for this client
-    await pool.query('UPDATE client_config SET xero_tenant_id = $1 WHERE id = $2', [tenantId, clientId]);
+      // Auto-match each returned org against client_config, by existing xero_tenant_id
+      // first, then by exact client_name == org name as a fallback.
+      const { rows: clients } = await pool.query('SELECT id, client_name, xero_tenant_id FROM client_config');
+      const matched = [];
+      const unmatched = [];
 
-    res.send('<h2>Xero connected successfully.</h2><p>You can close this window.</p>');
+      for (const org of orgs) {
+        const byTenantId = clients.find((c) => c.xero_tenant_id === org.tenantId);
+        const byName = clients.find((c) => c.client_name === org.tenantName);
+        const match = byTenantId || byName;
+        if (match) {
+          await tokenManager.linkClientToConnection(match.id, connectionId, org.tenantId);
+          matched.push(`${match.client_name} → ${org.tenantName}`);
+        } else {
+          unmatched.push(org.tenantName);
+        }
+      }
+
+      const html = `
+        <h2>Practice connection created.</h2>
+        <p><strong>Matched (${matched.length}):</strong></p>
+        <ul>${matched.map((m) => `<li>${m}</li>`).join('') || '<li>None</li>'}</ul>
+        <p><strong>Unmatched orgs (${unmatched.length}) — no client_config row found for these:</strong></p>
+        <ul>${unmatched.map((m) => `<li>${m}</li>`).join('') || '<li>None</li>'}</ul>
+        <p>Unmatched orgs need a client_config row created (matching client_name or xero_tenant_id) then re-run this connect flow, or link manually.</p>
+      `;
+      return res.send(html);
+    }
+
+    res.status(400).send('Unknown OAuth mode in state.');
   } catch (e) {
     console.error('OAuth callback error:', e);
     res.status(500).send(`Connection failed: ${e.message}`);
