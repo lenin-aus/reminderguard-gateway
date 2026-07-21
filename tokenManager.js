@@ -115,4 +115,4 @@ async function getValidToken(clientId) {
   throw err;
 }
 
-module.exports = { createConnection, linkClientToConnection, getMapping, getConnection, getValidToken };
+module.exports = { createConnection, linkClientToConnection, getMapping, getConnection, getValidToken, saveRefreshedTokens };
