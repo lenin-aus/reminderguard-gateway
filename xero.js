@@ -55,7 +55,11 @@ async function refreshAccessToken(refreshToken) {
     }),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(`Xero token refresh failed: ${JSON.stringify(data)}`);
+  if (!res.ok) {
+    const err = new Error(`Xero token refresh failed: ${JSON.stringify(data)}`);
+    err.xeroError = data.error; // e.g. 'invalid_grant' when the client has revoked access in Xero
+    throw err;
+  }
   return data; // includes a NEW refresh_token — old one is now invalid (rotation)
 }
 

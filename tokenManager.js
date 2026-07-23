@@ -46,6 +46,19 @@ async function getConnection(connectionId) {
   return rows[0] || null;
 }
 
+// Called only when Xero confirms the refresh token itself is dead (invalid_grant) —
+// i.e. the client disconnected the app in Xero. Nulls stored tokens so future
+// attempts fail fast instead of retrying a token that will never work again.
+// Deliberately does NOT touch oauth_tokens (breaks Branch A reconnect matching)
+// or sessions (client should still see a clear "reconnect" message, not be logged out).
+async function markConnectionRevoked(connectionId) {
+  await pool.query(
+    `UPDATE connections SET access_token = NULL, refresh_token = NULL, is_refreshing = false, updated_at = now()
+     WHERE id = $1`,
+    [connectionId]
+  );
+}
+
 async function saveRefreshedTokens(connectionId, tokenResponse) {
   const expiryTime = new Date(Date.now() + tokenResponse.expires_in * 1000);
   await pool.query(
@@ -73,6 +86,13 @@ async function getValidToken(clientId) {
     throw err;
   }
 
+  if (!conn.access_token || !conn.refresh_token) {
+    // Already marked dead by a previous failed refresh attempt — fail fast, no point retrying.
+    const err = new Error('Xero connection was disconnected by the client. Reconnect required.');
+    err.code = 'RECONNECT_REQUIRED';
+    throw err;
+  }
+
   const isExpiringSoon = new Date(conn.expiry_time).getTime() - Date.now() < EXPIRY_BUFFER_MS;
 
   if (!isExpiringSoon) {
@@ -95,6 +115,13 @@ async function getValidToken(clientId) {
       await saveRefreshedTokens(connectionId, refreshed);
       return { accessToken: refreshed.access_token, tenantId: mapping.xero_tenant_id };
     } catch (e) {
+      if (e.xeroError === 'invalid_grant') {
+        // Client disconnected the app in Xero — this refresh token will never work again.
+        await markConnectionRevoked(connectionId);
+        const err = new Error('Xero connection was disconnected by the client. Reconnect required.');
+        err.code = 'RECONNECT_REQUIRED';
+        throw err;
+      }
       await pool.query('UPDATE connections SET is_refreshing = false WHERE id = $1', [connectionId]);
       const err = new Error(`Token refresh failed for connection ${connectionId}: ${e.message}`);
       err.code = 'REFRESH_FAILED';
@@ -115,4 +142,4 @@ async function getValidToken(clientId) {
   throw err;
 }
 
-module.exports = { createConnection, linkClientToConnection, getMapping, getConnection, getValidToken, saveRefreshedTokens };
+module.exports = { createConnection, linkClientToConnection, getMapping, getConnection, getValidToken, saveRefreshedTokens, markConnectionRevoked };

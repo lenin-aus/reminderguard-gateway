@@ -273,6 +273,7 @@ app.all('/proxy/xero/:clientId/*', async (req, res) => {
   } catch (e) {
     console.error(`[${correlationId}] Proxy error client=${clientId}:`, e.message);
     if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
+    if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
     res.status(502).json({ error: e.message, code: e.code || 'PROXY_ERROR' });
   }
 });
