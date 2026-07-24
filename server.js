@@ -203,8 +203,22 @@ app.get('/oauth/callback', async (req, res) => {
 });
 
 // ── Self-serve session check — Appsmith's onPageLoad calls this ───────────
-app.get('/session/whoami', resolveSession, (req, res) => {
-  res.json({ client_id: req.client_id, status: 'active' });
+app.get('/session/whoami', resolveSession, async (req, res) => {
+  const connResult = await pool.query(
+    `SELECT c.access_token, c.refresh_token
+     FROM oauth_tokens ot
+     JOIN connections c ON c.id = ot.connection_id
+     WHERE ot.client_id = $1`,
+    [req.client_id]
+  );
+
+  const conn = connResult.rows[0];
+  const reconnectRequired = !conn || conn.access_token === null || conn.refresh_token === null;
+
+  res.json({
+    client_id: req.client_id,
+    status: reconnectRequired ? 'RECONNECT_REQUIRED' : 'active'
+  });
 });
 
 // ── Self-serve report trigger — checks completeness, then forwards to n8n ──
