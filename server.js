@@ -6,11 +6,13 @@ const fetch = require('node-fetch');
 const pool = require('./db');
 const xero = require('./xero');
 const tokenManager = require('./tokenManager');
+const { encrypt, decrypt } = require('./crypto');
 const { isConfigComplete } = require('./config');
 const { createSession, resolveSession, startSessionCleanupJob } = require('./session');
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
 // Self-serve Appsmith app + n8n trigger target — all resolved via env, not hardcoded.
@@ -131,6 +133,32 @@ app.get('/oauth/callback', async (req, res) => {
 
     // ── Self-serve mode: connect-first — identity resolved here, not upfront ──
     if (parsedState.mode === 'self_serve') {
+      // Xero's /connections returns EVERY org this Xero login has ever
+      // authorized for this app, not just the one picked in this consent
+      // screen. When there's more than one, we cannot safely guess which
+      // one the user meant — show a picker instead of grabbing orgs[0].
+      if (orgs.length > 1) {
+        const selectionId = crypto.randomBytes(32).toString('hex');
+        await pool.query(
+          `INSERT INTO pending_connections (selection_id, encrypted_access_token, encrypted_refresh_token, expires_in)
+           VALUES ($1, $2, $3, $4)`,
+          [selectionId, encrypt(tokenResponse.access_token), encrypt(tokenResponse.refresh_token), tokenResponse.expires_in]
+        );
+
+        const { rows: existingClients } = await pool.query('SELECT xero_tenant_id FROM client_config');
+        const connectedTenantIds = new Set(existingClients.map((c) => c.xero_tenant_id));
+
+        const optionsHtml = orgs.map((org) => `
+          <form method="POST" action="/oauth/select-org" style="margin-bottom: 10px;">
+            <input type="hidden" name="selectionId" value="${selectionId}" />
+            <input type="hidden" name="tenant_id" value="${org.tenantId}" />
+            <button type="submit">${org.tenantName} ${connectedTenantIds.has(org.tenantId) ? '(already connected)' : '(new)'}</button>
+          </form>
+        `).join('');
+
+        return res.send(`<h2>Choose your organisation</h2>${optionsHtml}`);
+      }
+
       const tenantId = orgs[0].tenantId;
       const tenantName = orgs[0].tenantName;
 
@@ -198,6 +226,90 @@ app.get('/oauth/callback', async (req, res) => {
     res.status(400).send('Unknown OAuth mode in state.');
   } catch (e) {
     console.error('OAuth callback error:', e);
+    res.status(500).send(`Connection failed: ${e.message}`);
+  }
+});
+
+// ── Multi-org picker: user's chosen tenant lands here ──────────────────────
+// Only reached when /oauth/callback found orgs.length > 1 in self-serve mode.
+// Re-verifies the submitted tenant_id against a fresh Xero /connections call
+// before proceeding — never trusts the form value alone.
+app.post('/oauth/select-org', async (req, res) => {
+  const { selectionId, tenant_id: tenantId } = req.body;
+  if (!selectionId || !tenantId) return res.status(400).send('Missing selection.');
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM pending_connections WHERE selection_id = $1 AND created_at > NOW() - INTERVAL '10 minutes'`,
+      [selectionId]
+    );
+    if (!rows.length) return res.status(400).send('This selection has expired. Please reconnect to Xero.');
+
+    // Single-use — delete immediately on read so this link can't be replayed.
+    await pool.query('DELETE FROM pending_connections WHERE selection_id = $1', [selectionId]);
+
+    const pending = rows[0];
+    const accessToken = decrypt(pending.encrypted_access_token);
+    const refreshToken = decrypt(pending.encrypted_refresh_token);
+    const tokenResponse = { access_token: accessToken, refresh_token: refreshToken, expires_in: pending.expires_in };
+
+    // Live re-verification: confirm the submitted tenant_id is genuinely
+    // among this token's authorized orgs — don't trust the form value alone.
+    const freshOrgs = await xero.fetchConnections(accessToken);
+    const chosenOrg = freshOrgs.find((o) => o.tenantId === tenantId);
+    if (!chosenOrg) return res.status(400).send('Selected organisation is not authorized for this connection.');
+
+    const tenantName = chosenOrg.tenantName;
+
+    const existing = await pool.query(
+      'SELECT client_id, connection_id FROM oauth_tokens WHERE xero_tenant_id = $1',
+      [tenantId]
+    );
+
+    let clientId;
+
+    if (existing.rows.length > 0) {
+      clientId = existing.rows[0].client_id;
+      await tokenManager.saveRefreshedTokens(existing.rows[0].connection_id, tokenResponse);
+    } else {
+      try {
+        const c = await pool.query(
+          "INSERT INTO client_config (client_name, xero_tenant_id, super_payment_mode) VALUES ($1, $2, 'payday') RETURNING id",
+          [tenantName, tenantId]
+        );
+        clientId = c.rows[0].id;
+        const connectionId = await tokenManager.createConnection(tokenResponse, 'self_serve', tenantName);
+        await tokenManager.linkClientToConnection(clientId, connectionId, tenantId);
+      } catch (e) {
+        if (e.code === '23505') {
+          const retry = await pool.query(
+            'SELECT client_id, connection_id FROM oauth_tokens WHERE xero_tenant_id = $1',
+            [tenantId]
+          );
+          clientId = retry.rows[0].client_id;
+          await tokenManager.saveRefreshedTokens(retry.rows[0].connection_id, tokenResponse);
+        } else {
+          throw e;
+        }
+      }
+    }
+
+    const { rows: configRows } = await pool.query('SELECT * FROM client_config WHERE id = $1', [clientId]);
+    const complete = isConfigComplete(configRows[0]);
+
+    const sessionToken = await createSession(clientId);
+    res.cookie('rg_token', sessionToken, {
+      domain: '.fasttrackledger.com',
+      secure: true,
+      httpOnly: false,
+      sameSite: 'Lax',
+      maxAge: 30 * 24 * 60 * 60 * 1000,
+    });
+
+    const destination = complete ? SELF_SERVE_DASHBOARD_URL : SELF_SERVE_SETUP_WIZARD_URL;
+    return res.redirect(`${destination}?token=${sessionToken}`);
+  } catch (e) {
+    console.error('Select-org error:', e);
     res.status(500).send(`Connection failed: ${e.message}`);
   }
 });
