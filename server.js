@@ -21,6 +21,7 @@ const SELF_SERVE_SETUP_WIZARD_URL = process.env.SELF_SERVE_SETUP_WIZARD_URL;
 const SELF_SERVE_DASHBOARD_URL = process.env.SELF_SERVE_DASHBOARD_URL;
 const N8N_NIGHTLY_REPORT_URL = process.env.N8N_NIGHTLY_REPORT_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY;
+const N8N_AUTO_STATEMENTS_URL = process.env.N8N_AUTO_STATEMENTS_URL;
 
 function encodeState(obj) {
   return Buffer.from(JSON.stringify(obj)).toString('base64url');
@@ -355,6 +356,28 @@ app.post('/trigger/nightly-report/:clientId', async (req, res) => {
     res.status(n8nRes.status).type('application/json').send(body);
   } catch (e) {
     console.error('Trigger nightly report error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Self-serve Auto Statements trigger ──────────────────────────────────
+app.post('/trigger/auto-statements/:clientId', async (req, res) => {
+  const { clientId } = req.params;
+  try {
+    const config = await pool.query('SELECT auto_statements_email FROM client_config WHERE id = $1', [clientId]);
+    if (!config.rows.length || !config.rows[0].auto_statements_email) {
+      return res.status(400).json({ error: 'Please save your Auto Statements email first' });
+    }
+
+    const n8nRes = await fetch(N8N_AUTO_STATEMENTS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': N8N_API_KEY },
+      body: JSON.stringify({ client_id: clientId }),
+    });
+    const body = await n8nRes.text();
+    res.status(n8nRes.status).type('application/json').send(body);
+  } catch (e) {
+    console.error('Trigger auto statements error:', e);
     res.status(500).json({ error: e.message });
   }
 });
