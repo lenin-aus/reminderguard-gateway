@@ -22,12 +22,23 @@ const SELF_SERVE_DASHBOARD_URL = process.env.SELF_SERVE_DASHBOARD_URL;
 const N8N_NIGHTLY_REPORT_URL = process.env.N8N_NIGHTLY_REPORT_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY;
 const N8N_AUTO_STATEMENTS_URL = process.env.N8N_AUTO_STATEMENTS_URL;
+// fastledger is a second Appsmith app consuming this same Gateway — its
+// post-connect destination, set alongside the other SELF_SERVE_*_URL vars.
+const FASTLEDGER_URL = process.env.FASTLEDGER_URL;
 
 function encodeState(obj) {
   return Buffer.from(JSON.stringify(obj)).toString('base64url');
 }
 function decodeState(b64) {
   return JSON.parse(Buffer.from(b64, 'base64url').toString('utf8'));
+}
+
+// Resolves where a self-serve login should land after connecting, based on
+// which app it came from (returnApp) and whether onboarding is complete.
+// Shared by /oauth/callback and /oauth/select-org so both paths agree.
+function resolveDestination(returnApp, complete) {
+  if (returnApp === 'fastledger') return FASTLEDGER_URL;
+  return complete ? SELF_SERVE_DASHBOARD_URL : SELF_SERVE_SETUP_WIZARD_URL;
 }
 
 // ── Health check ──────────────────────────────────────────────────────────
@@ -37,9 +48,12 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 // No client_id needed anymore — identity (new vs returning tenant) is
 // resolved entirely in the callback, from Xero's own /connections response.
 // A random nonce + short-lived httpOnly cookie protects against CSRF.
+// returnApp tells the callback which Appsmith app to send the user back to
+// once connected — defaults to 'reminderguard' if not specified.
 app.get('/oauth/connect', (req, res) => {
   const nonce = crypto.randomBytes(16).toString('hex');
-  const state = encodeState({ mode: 'self_serve', nonce });
+  const returnApp = req.query.returnApp === 'fastledger' ? 'fastledger' : 'reminderguard';
+  const state = encodeState({ mode: 'self_serve', nonce, returnApp });
   res.cookie('oauth_state', nonce, {
     httpOnly: true,
     secure: true,
@@ -141,9 +155,9 @@ app.get('/oauth/callback', async (req, res) => {
       if (orgs.length > 1) {
         const selectionId = crypto.randomBytes(32).toString('hex');
         await pool.query(
-          `INSERT INTO pending_connections (selection_id, encrypted_access_token, encrypted_refresh_token, expires_in)
-           VALUES ($1, $2, $3, $4)`,
-          [selectionId, encrypt(tokenResponse.access_token), encrypt(tokenResponse.refresh_token), tokenResponse.expires_in]
+          `INSERT INTO pending_connections (selection_id, encrypted_access_token, encrypted_refresh_token, expires_in, return_app)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [selectionId, encrypt(tokenResponse.access_token), encrypt(tokenResponse.refresh_token), tokenResponse.expires_in, parsedState.returnApp]
         );
 
         const { rows: existingClients } = await pool.query('SELECT xero_tenant_id FROM client_config');
@@ -220,7 +234,7 @@ app.get('/oauth/callback', async (req, res) => {
         maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
       });
 
-      const destination = complete ? SELF_SERVE_DASHBOARD_URL : SELF_SERVE_SETUP_WIZARD_URL;
+      const destination = resolveDestination(parsedState.returnApp, complete);
       return res.redirect(`${destination}?token=${sessionToken}`);
     }
 
@@ -253,6 +267,9 @@ app.post('/oauth/select-org', async (req, res) => {
     const accessToken = decrypt(pending.encrypted_access_token);
     const refreshToken = decrypt(pending.encrypted_refresh_token);
     const tokenResponse = { access_token: accessToken, refresh_token: refreshToken, expires_in: pending.expires_in };
+    // Carried over from /oauth/connect via pending_connections — this request
+    // has no access to the original state, so it must come from the DB row.
+    const returnApp = pending.return_app;
 
     // Live re-verification: confirm the submitted tenant_id is genuinely
     // among this token's authorized orgs — don't trust the form value alone.
@@ -307,7 +324,7 @@ app.post('/oauth/select-org', async (req, res) => {
       maxAge: 30 * 24 * 60 * 60 * 1000,
     });
 
-    const destination = complete ? SELF_SERVE_DASHBOARD_URL : SELF_SERVE_SETUP_WIZARD_URL;
+    const destination = resolveDestination(returnApp, complete);
     return res.redirect(`${destination}?token=${sessionToken}`);
   } catch (e) {
     console.error('Select-org error:', e);
