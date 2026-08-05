@@ -444,6 +444,143 @@ app.all('/proxy/xero/:clientId/*', async (req, res) => {
   }
 });
 
+// ── Self-serve Auto Statements customer list ──────────────────────────────
+// GET /clients/:clientId/statements/customers
+// Session-authenticated (resolveSession) — req.client_id comes from the
+// verified session token, NOT the :clientId path param, so a client can
+// only ever pull their own data regardless of what's in the URL.
+app.get('/clients/:clientId/statements/customers', resolveSession, async (req, res) => {
+  const { clientId } = req.params;
+
+  // Reject if the URL's clientId doesn't match the authenticated session's
+  // own client_id — prevents one logged-in client from reading another's data.
+  if (String(req.client_id) !== String(clientId)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  try {
+    const { accessToken, tenantId } = await tokenManager.getValidToken(clientId);
+
+    const invoicesRes = await fetch(
+      'https://api.xero.com/api.xro/2.0/Invoices?Statuses=AUTHORISED&summaryOnly=false',
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Xero-tenant-id': tenantId,
+          Accept: 'application/json',
+        },
+      }
+    );
+    const invoicesData = await invoicesRes.json();
+    if (!invoicesRes.ok) {
+      return res.status(502).json({ error: 'Xero request failed', detail: invoicesData });
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    function parseXeroDate(dateVal) {
+      if (!dateVal) return null;
+      if (typeof dateVal === 'string' && dateVal.startsWith('/Date(')) {
+        const ms = parseInt(dateVal.replace('/Date(', '').replace(/[^0-9]/g, ''));
+        return new Date(ms);
+      }
+      const d = new Date(dateVal);
+      return isNaN(d.getTime()) ? null : d;
+    }
+
+    function daysDiff(date) {
+      if (!date) return 0;
+      return Math.floor((today - date) / (1000 * 60 * 60 * 24));
+    }
+
+    const allInvoices = invoicesData.Invoices || [];
+    const buckets = {};
+
+    for (const inv of allInvoices) {
+      // Same filtering as the production Auto Statements n8n workflow.
+      if (inv.Type !== 'ACCREC') continue;
+
+      const contact = inv.Contact || {};
+      const contactId = contact.ContactID;
+      if (!contactId) continue;
+
+      const amountDue = parseFloat(inv.AmountDue) || 0;
+      if (amountDue <= 0) continue;
+
+      if (inv.CurrencyCode && inv.CurrencyCode !== 'AUD') continue;
+
+      if (!buckets[contactId]) {
+        buckets[contactId] = {
+          contactId,
+          contactName: contact.Name || contactId,
+          hasEmail: false, // filled in below via a separate Contacts lookup
+          theyOwe: 0,
+          overdueAmount: 0,
+          daysOverdue: 0,
+        };
+      }
+
+      const bucket = buckets[contactId];
+      const dueDate = parseXeroDate(inv.DueDateString || inv.DueDate);
+      const daysOverdueForInvoice = dueDate ? Math.max(0, daysDiff(dueDate)) : 0;
+
+      bucket.theyOwe += amountDue;
+      // New logic not present in the n8n workflow — sums only the overdue
+      // portion, separate from the total outstanding figure.
+      if (daysOverdueForInvoice > 0) {
+        bucket.overdueAmount += amountDue;
+      }
+      if (daysOverdueForInvoice > bucket.daysOverdue) {
+        bucket.daysOverdue = daysOverdueForInvoice;
+      }
+    }
+
+    const contactIds = Object.keys(buckets);
+
+    // hasEmail lookup — same per-contact Contacts call pattern as the n8n
+    // workflow's "Get Contact Email" node, done in parallel here instead of
+    // n8n's Split In Batches loop.
+    await Promise.all(
+      contactIds.map(async (contactId) => {
+        try {
+          const contactRes = await fetch(
+            `https://api.xero.com/api.xro/2.0/Contacts/${contactId}`,
+            {
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                'Xero-tenant-id': tenantId,
+                Accept: 'application/json',
+              },
+            }
+          );
+          const contactData = await contactRes.json();
+          const xeroContact = (contactData.Contacts || [])[0] || {};
+          const email = (xeroContact.EmailAddress || '').trim();
+          buckets[contactId].hasEmail = email.length > 0;
+        } catch (e) {
+          // If a single contact lookup fails, default to hasEmail: false
+          // rather than failing the whole response.
+          buckets[contactId].hasEmail = false;
+        }
+      })
+    );
+
+    const customers = Object.values(buckets).map((b) => ({
+      ...b,
+      theyOwe: parseFloat(b.theyOwe.toFixed(2)),
+      overdueAmount: parseFloat(b.overdueAmount.toFixed(2)),
+    }));
+
+    res.json({ customers });
+  } catch (e) {
+    console.error('Statements customers error:', e);
+    if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
+    if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
+    res.status(502).json({ error: e.message, code: e.code || 'GATEWAY_ERROR' });
+  }
+});
+
 // ── Xero disconnect webhook ─────────────────────────────────────────────
 // TODO before go-live: validate the HMAC-SHA256 signature Xero sends in the
 // 'x-xero-signature' header, using your webhook signing key from the Xero
