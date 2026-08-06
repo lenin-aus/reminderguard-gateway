@@ -206,9 +206,13 @@ const worker = new Worker('auto-statements', async (job) => {
     if (daysOverdue > bucket.OldestDaysOverdue) bucket.OldestDaysOverdue = daysOverdue;
   }
 
+  console.log('[Worker] Fetched invoices, contact count in buckets:', Object.keys(buckets).length);
+
   const sentResults = [];
   const skippedResults = [];
   const failedResults = [];
+
+  console.log('[Worker] Processing', Object.values(buckets).length, 'contacts');
 
   for (const contact of Object.values(buckets)) {
     contact.ToneTier = getToneTier(contact.OldestDaysOverdue);
