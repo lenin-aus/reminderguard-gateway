@@ -157,6 +157,8 @@ const worker = new Worker('auto-statements', async (job) => {
   const senderEmail = clientConfig.sender_email;
   const senderName = clientConfig.sender_name || clientName;
 
+  console.log('[Worker] Client config fetched:', clientConfig.client_name);
+
   const invoicesData = await xeroGet(
     'https://api.xero.com/api.xro/2.0/Invoices?Statuses=AUTHORISED&summaryOnly=false',
     accessToken, tenantId
