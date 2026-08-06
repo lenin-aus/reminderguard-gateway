@@ -6,11 +6,13 @@ const fetch = require('node-fetch');
 const pool = require('./db');
 const xero = require('./xero');
 const tokenManager = require('./tokenManager');
+const { encrypt, decrypt } = require('./crypto');
 const { isConfigComplete } = require('./config');
 const { createSession, resolveSession, startSessionCleanupJob } = require('./session');
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
 // Self-serve Appsmith app + n8n trigger target — all resolved via env, not hardcoded.
@@ -19,12 +21,24 @@ const SELF_SERVE_SETUP_WIZARD_URL = process.env.SELF_SERVE_SETUP_WIZARD_URL;
 const SELF_SERVE_DASHBOARD_URL = process.env.SELF_SERVE_DASHBOARD_URL;
 const N8N_NIGHTLY_REPORT_URL = process.env.N8N_NIGHTLY_REPORT_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY;
+const N8N_AUTO_STATEMENTS_URL = process.env.N8N_AUTO_STATEMENTS_URL;
+// fastledger is a second Appsmith app consuming this same Gateway — its
+// post-connect destination, set alongside the other SELF_SERVE_*_URL vars.
+const FASTLEDGER_URL = process.env.FASTLEDGER_URL;
 
 function encodeState(obj) {
   return Buffer.from(JSON.stringify(obj)).toString('base64url');
 }
 function decodeState(b64) {
   return JSON.parse(Buffer.from(b64, 'base64url').toString('utf8'));
+}
+
+// Resolves where a self-serve login should land after connecting, based on
+// which app it came from (returnApp) and whether onboarding is complete.
+// Shared by /oauth/callback and /oauth/select-org so both paths agree.
+function resolveDestination(returnApp, complete) {
+  if (returnApp === 'fastledger') return FASTLEDGER_URL;
+  return complete ? SELF_SERVE_DASHBOARD_URL : SELF_SERVE_SETUP_WIZARD_URL;
 }
 
 // ── Health check ──────────────────────────────────────────────────────────
@@ -34,9 +48,12 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 // No client_id needed anymore — identity (new vs returning tenant) is
 // resolved entirely in the callback, from Xero's own /connections response.
 // A random nonce + short-lived httpOnly cookie protects against CSRF.
+// returnApp tells the callback which Appsmith app to send the user back to
+// once connected — defaults to 'reminderguard' if not specified.
 app.get('/oauth/connect', (req, res) => {
   const nonce = crypto.randomBytes(16).toString('hex');
-  const state = encodeState({ mode: 'self_serve', nonce });
+  const returnApp = req.query.returnApp === 'fastledger' ? 'fastledger' : 'reminderguard';
+  const state = encodeState({ mode: 'self_serve', nonce, returnApp });
   res.cookie('oauth_state', nonce, {
     httpOnly: true,
     secure: true,
@@ -131,6 +148,32 @@ app.get('/oauth/callback', async (req, res) => {
 
     // ── Self-serve mode: connect-first — identity resolved here, not upfront ──
     if (parsedState.mode === 'self_serve') {
+      // Xero's /connections returns EVERY org this Xero login has ever
+      // authorized for this app, not just the one picked in this consent
+      // screen. When there's more than one, we cannot safely guess which
+      // one the user meant — show a picker instead of grabbing orgs[0].
+      if (orgs.length > 1) {
+        const selectionId = crypto.randomBytes(32).toString('hex');
+        await pool.query(
+          `INSERT INTO pending_connections (selection_id, encrypted_access_token, encrypted_refresh_token, expires_in, return_app)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [selectionId, encrypt(tokenResponse.access_token), encrypt(tokenResponse.refresh_token), tokenResponse.expires_in, parsedState.returnApp]
+        );
+
+        const { rows: existingClients } = await pool.query('SELECT xero_tenant_id FROM client_config');
+        const connectedTenantIds = new Set(existingClients.map((c) => c.xero_tenant_id));
+
+        const optionsHtml = orgs.map((org) => `
+          <form method="POST" action="/oauth/select-org" style="margin-bottom: 10px;">
+            <input type="hidden" name="selectionId" value="${selectionId}" />
+            <input type="hidden" name="tenant_id" value="${org.tenantId}" />
+            <button type="submit">${org.tenantName} ${connectedTenantIds.has(org.tenantId) ? '(already connected)' : '(new)'}</button>
+          </form>
+        `).join('');
+
+        return res.send(`<h2>Choose your organisation</h2>${optionsHtml}`);
+      }
+
       const tenantId = orgs[0].tenantId;
       const tenantName = orgs[0].tenantName;
 
@@ -191,7 +234,7 @@ app.get('/oauth/callback', async (req, res) => {
         maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
       });
 
-      const destination = complete ? SELF_SERVE_DASHBOARD_URL : SELF_SERVE_SETUP_WIZARD_URL;
+      const destination = resolveDestination(parsedState.returnApp, complete);
       return res.redirect(`${destination}?token=${sessionToken}`);
     }
 
@@ -202,9 +245,110 @@ app.get('/oauth/callback', async (req, res) => {
   }
 });
 
+// ── Multi-org picker: user's chosen tenant lands here ──────────────────────
+// Only reached when /oauth/callback found orgs.length > 1 in self-serve mode.
+// Re-verifies the submitted tenant_id against a fresh Xero /connections call
+// before proceeding — never trusts the form value alone.
+app.post('/oauth/select-org', async (req, res) => {
+  const { selectionId, tenant_id: tenantId } = req.body;
+  if (!selectionId || !tenantId) return res.status(400).send('Missing selection.');
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM pending_connections WHERE selection_id = $1 AND created_at > NOW() - INTERVAL '10 minutes'`,
+      [selectionId]
+    );
+    if (!rows.length) return res.status(400).send('This selection has expired. Please reconnect to Xero.');
+
+    // Single-use — delete immediately on read so this link can't be replayed.
+    await pool.query('DELETE FROM pending_connections WHERE selection_id = $1', [selectionId]);
+
+    const pending = rows[0];
+    const accessToken = decrypt(pending.encrypted_access_token);
+    const refreshToken = decrypt(pending.encrypted_refresh_token);
+    const tokenResponse = { access_token: accessToken, refresh_token: refreshToken, expires_in: pending.expires_in };
+    // Carried over from /oauth/connect via pending_connections — this request
+    // has no access to the original state, so it must come from the DB row.
+    const returnApp = pending.return_app;
+
+    // Live re-verification: confirm the submitted tenant_id is genuinely
+    // among this token's authorized orgs — don't trust the form value alone.
+    const freshOrgs = await xero.fetchConnections(accessToken);
+    const chosenOrg = freshOrgs.find((o) => o.tenantId === tenantId);
+    if (!chosenOrg) return res.status(400).send('Selected organisation is not authorized for this connection.');
+
+    const tenantName = chosenOrg.tenantName;
+
+    const existing = await pool.query(
+      'SELECT client_id, connection_id FROM oauth_tokens WHERE xero_tenant_id = $1',
+      [tenantId]
+    );
+
+    let clientId;
+
+    if (existing.rows.length > 0) {
+      clientId = existing.rows[0].client_id;
+      await tokenManager.saveRefreshedTokens(existing.rows[0].connection_id, tokenResponse);
+    } else {
+      try {
+        const c = await pool.query(
+          "INSERT INTO client_config (client_name, xero_tenant_id, super_payment_mode) VALUES ($1, $2, 'payday') RETURNING id",
+          [tenantName, tenantId]
+        );
+        clientId = c.rows[0].id;
+        const connectionId = await tokenManager.createConnection(tokenResponse, 'self_serve', tenantName);
+        await tokenManager.linkClientToConnection(clientId, connectionId, tenantId);
+      } catch (e) {
+        if (e.code === '23505') {
+          const retry = await pool.query(
+            'SELECT client_id, connection_id FROM oauth_tokens WHERE xero_tenant_id = $1',
+            [tenantId]
+          );
+          clientId = retry.rows[0].client_id;
+          await tokenManager.saveRefreshedTokens(retry.rows[0].connection_id, tokenResponse);
+        } else {
+          throw e;
+        }
+      }
+    }
+
+    const { rows: configRows } = await pool.query('SELECT * FROM client_config WHERE id = $1', [clientId]);
+    const complete = isConfigComplete(configRows[0]);
+
+    const sessionToken = await createSession(clientId);
+    res.cookie('rg_token', sessionToken, {
+      domain: '.fasttrackledger.com',
+      secure: true,
+      httpOnly: false,
+      sameSite: 'Lax',
+      maxAge: 30 * 24 * 60 * 60 * 1000,
+    });
+
+    const destination = resolveDestination(returnApp, complete);
+    return res.redirect(`${destination}?token=${sessionToken}`);
+  } catch (e) {
+    console.error('Select-org error:', e);
+    res.status(500).send(`Connection failed: ${e.message}`);
+  }
+});
+
 // ── Self-serve session check — Appsmith's onPageLoad calls this ───────────
-app.get('/session/whoami', resolveSession, (req, res) => {
-  res.json({ client_id: req.client_id, status: 'active' });
+app.get('/session/whoami', resolveSession, async (req, res) => {
+  const connResult = await pool.query(
+    `SELECT c.access_token, c.refresh_token
+     FROM oauth_tokens ot
+     JOIN connections c ON c.id = ot.connection_id
+     WHERE ot.client_id = $1`,
+    [req.client_id]
+  );
+
+  const conn = connResult.rows[0];
+  const reconnectRequired = !conn || conn.access_token === null || conn.refresh_token === null;
+
+  res.json({
+    client_id: req.client_id,
+    status: reconnectRequired ? 'RECONNECT_REQUIRED' : 'active'
+  });
 });
 
 // ── Self-serve report trigger — checks completeness, then forwards to n8n ──
@@ -229,6 +373,28 @@ app.post('/trigger/nightly-report/:clientId', async (req, res) => {
     res.status(n8nRes.status).type('application/json').send(body);
   } catch (e) {
     console.error('Trigger nightly report error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Self-serve Auto Statements trigger ──────────────────────────────────
+app.post('/trigger/auto-statements/:clientId', async (req, res) => {
+  const { clientId } = req.params;
+  try {
+    const config = await pool.query('SELECT auto_statements_email FROM client_config WHERE id = $1', [clientId]);
+    if (!config.rows.length || !config.rows[0].auto_statements_email) {
+      return res.status(400).json({ error: 'Please save your Auto Statements email first' });
+    }
+
+    const n8nRes = await fetch(N8N_AUTO_STATEMENTS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': N8N_API_KEY },
+      body: JSON.stringify({ client_id: clientId }),
+    });
+    const body = await n8nRes.text();
+    res.status(n8nRes.status).type('application/json').send(body);
+  } catch (e) {
+    console.error('Trigger auto statements error:', e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -275,6 +441,143 @@ app.all('/proxy/xero/:clientId/*', async (req, res) => {
     if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
     if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
     res.status(502).json({ error: e.message, code: e.code || 'PROXY_ERROR' });
+  }
+});
+
+// ── Self-serve Auto Statements customer list ──────────────────────────────
+// GET /clients/:clientId/statements/customers
+// Session-authenticated (resolveSession) — req.client_id comes from the
+// verified session token, NOT the :clientId path param, so a client can
+// only ever pull their own data regardless of what's in the URL.
+app.get('/clients/:clientId/statements/customers', resolveSession, async (req, res) => {
+  const { clientId } = req.params;
+
+  // Reject if the URL's clientId doesn't match the authenticated session's
+  // own client_id — prevents one logged-in client from reading another's data.
+  if (String(req.client_id) !== String(clientId)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  try {
+    const { accessToken, tenantId } = await tokenManager.getValidToken(clientId);
+
+    const invoicesRes = await fetch(
+      'https://api.xero.com/api.xro/2.0/Invoices?Statuses=AUTHORISED&summaryOnly=false',
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Xero-tenant-id': tenantId,
+          Accept: 'application/json',
+        },
+      }
+    );
+    const invoicesData = await invoicesRes.json();
+    if (!invoicesRes.ok) {
+      return res.status(502).json({ error: 'Xero request failed', detail: invoicesData });
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    function parseXeroDate(dateVal) {
+      if (!dateVal) return null;
+      if (typeof dateVal === 'string' && dateVal.startsWith('/Date(')) {
+        const ms = parseInt(dateVal.replace('/Date(', '').replace(/[^0-9]/g, ''));
+        return new Date(ms);
+      }
+      const d = new Date(dateVal);
+      return isNaN(d.getTime()) ? null : d;
+    }
+
+    function daysDiff(date) {
+      if (!date) return 0;
+      return Math.floor((today - date) / (1000 * 60 * 60 * 24));
+    }
+
+    const allInvoices = invoicesData.Invoices || [];
+    const buckets = {};
+
+    for (const inv of allInvoices) {
+      // Same filtering as the production Auto Statements n8n workflow.
+      if (inv.Type !== 'ACCREC') continue;
+
+      const contact = inv.Contact || {};
+      const contactId = contact.ContactID;
+      if (!contactId) continue;
+
+      const amountDue = parseFloat(inv.AmountDue) || 0;
+      if (amountDue <= 0) continue;
+
+      if (inv.CurrencyCode && inv.CurrencyCode !== 'AUD') continue;
+
+      if (!buckets[contactId]) {
+        buckets[contactId] = {
+          contactId,
+          contactName: contact.Name || contactId,
+          hasEmail: false, // filled in below via a separate Contacts lookup
+          theyOwe: 0,
+          overdueAmount: 0,
+          daysOverdue: 0,
+        };
+      }
+
+      const bucket = buckets[contactId];
+      const dueDate = parseXeroDate(inv.DueDateString || inv.DueDate);
+      const daysOverdueForInvoice = dueDate ? Math.max(0, daysDiff(dueDate)) : 0;
+
+      bucket.theyOwe += amountDue;
+      // New logic not present in the n8n workflow — sums only the overdue
+      // portion, separate from the total outstanding figure.
+      if (daysOverdueForInvoice > 0) {
+        bucket.overdueAmount += amountDue;
+      }
+      if (daysOverdueForInvoice > bucket.daysOverdue) {
+        bucket.daysOverdue = daysOverdueForInvoice;
+      }
+    }
+
+    const contactIds = Object.keys(buckets);
+
+    // hasEmail lookup — same per-contact Contacts call pattern as the n8n
+    // workflow's "Get Contact Email" node, done in parallel here instead of
+    // n8n's Split In Batches loop.
+    await Promise.all(
+      contactIds.map(async (contactId) => {
+        try {
+          const contactRes = await fetch(
+            `https://api.xero.com/api.xro/2.0/Contacts/${contactId}`,
+            {
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                'Xero-tenant-id': tenantId,
+                Accept: 'application/json',
+              },
+            }
+          );
+          const contactData = await contactRes.json();
+          const xeroContact = (contactData.Contacts || [])[0] || {};
+          const email = (xeroContact.EmailAddress || '').trim();
+          buckets[contactId].hasEmail = email.length > 0;
+        } catch (e) {
+          // If a single contact lookup fails, default to hasEmail: false
+          // rather than failing the whole response.
+          buckets[contactId].hasEmail = false;
+        }
+      })
+    );
+
+    const customers = Object.values(buckets).map((b) => ({
+      ...b,
+      theyOwe: parseFloat(b.theyOwe.toFixed(2)),
+      overdueAmount: parseFloat(b.overdueAmount.toFixed(2)),
+    }));
+
+    res.json({ customers });
+  } catch (e) {
+    console.error('Statements customers error:', e);
+    if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
+    if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
+    res.status(502).json({ error: e.message, code: e.code || 'GATEWAY_ERROR' });
   }
 });
 
