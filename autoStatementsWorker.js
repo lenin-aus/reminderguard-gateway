@@ -148,7 +148,11 @@ const worker = new Worker('auto-statements', async (job) => {
 
   console.log('[Worker] Job started for client', clientId, 'contacts:', selectedContactIds);
 
+  console.log('[Worker] Fetching Xero token for client', clientId);
+
   const { accessToken, tenantId } = await tokenManager.getValidToken(clientId);
+
+  console.log('[Worker] Got Xero token, tenantId:', tenantId);
 
   const configRes = await pool.query('SELECT * FROM client_config WHERE id = $1', [clientId]);
   const clientConfig = configRes.rows[0] || {};
@@ -163,6 +167,8 @@ const worker = new Worker('auto-statements', async (job) => {
     'https://api.xero.com/api.xro/2.0/Invoices?Statuses=AUTHORISED&summaryOnly=false',
     accessToken, tenantId
   );
+
+  
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -324,6 +330,13 @@ const worker = new Worker('auto-statements', async (job) => {
     username: process.env.REDIS_USERNAME,
     password: process.env.REDIS_PASSWORD
   }
+});
+
+worker.on('failed', (job, err) => {
+  console.error('[Worker] Job FAILED:', job?.id, err?.message, err?.stack);
+});
+worker.on('error', (err) => {
+  console.error('[Worker] Worker-level ERROR:', err?.message, err?.stack);
 });
 
 module.exports = worker;
