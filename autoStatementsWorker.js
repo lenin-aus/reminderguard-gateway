@@ -290,7 +290,10 @@ const worker = new Worker('auto-statements', async (job) => {
           attachment: [{ content: pdfBase64, name: `Statement-${contact.ContactName}.pdf` }]
         })
       });
-      if (!brevoRes.ok) throw new Error(`Brevo send failed: ${brevoRes.status}`);
+     if (!brevoRes.ok) {
+     const errBody = await brevoRes.text();
+     throw new Error(`Brevo send failed: ${brevoRes.status} - ${errBody}`);
+   }
 
       await pool.query(
         `INSERT INTO sent_statements (contact_id, contact_name, statement_date, alert_email, created_at, updated_at)
