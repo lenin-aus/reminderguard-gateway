@@ -146,6 +146,8 @@ async function xeroGet(url, accessToken, tenantId) {
 const worker = new Worker('auto-statements', async (job) => {
   const { clientId, contactIds: selectedContactIds } = job.data;
 
+  console.log('[Worker] Job started for client', clientId, 'contacts:', selectedContactIds);
+
   const { accessToken, tenantId } = await tokenManager.getValidToken(clientId);
 
   const configRes = await pool.query('SELECT * FROM client_config WHERE id = $1', [clientId]);
