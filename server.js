@@ -10,7 +10,7 @@ const tokenManager = require('./tokenManager');
 const { encrypt, decrypt } = require('./crypto');
 const { isConfigComplete } = require('./config');
 const { createSession, resolveSession, startSessionCleanupJob } = require('./session');
-const { registerAllRepeatableJobs } = require('./scheduler');
+const { registerAllRepeatableJobs, registerRepeatableJob } = require('./scheduler');
 
 const app = express();
 app.use(express.json());
@@ -538,6 +538,22 @@ app.get('/clients/:clientId/statements/customers', resolveSession, async (req, r
     if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
     if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
     res.status(502).json({ error: e.message, code: e.code || 'GATEWAY_ERROR' });
+  }
+});
+
+app.post('/clients/:clientId/register-schedule', resolveSession, async (req, res) => {
+  try {
+    const clientId = parseInt(req.params.clientId, 10);
+    const { rows } = await pool.query('SELECT * FROM client_config WHERE id = $1', [clientId]);
+    const clientConfig = rows[0];
+    if (!clientConfig) {
+      return res.status(404).json({ error: 'Client not found' });
+    }
+    await registerRepeatableJob(schedulerQueue, clientConfig);
+    return res.json({ success: true, message: `Schedule registered for client ${clientId}` });
+  } catch (e) {
+    console.error('[register-schedule] Failed:', e.message);
+    return res.status(500).json({ error: 'Failed to register schedule' });
   }
 });
 
