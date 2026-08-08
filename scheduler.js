@@ -84,15 +84,15 @@ async function registerRepeatableJob(schedulerQueue, clientConfig) {
   const jobId = `statement-run-${clientConfig.id}`;
   const [hour, minute] = (clientConfig.schedule_time || '06:00').split(':');
 
-  await schedulerQueue.add(
-    'scheduled-check',
-    { clientId: clientConfig.id },
+  await schedulerQueue.upsertJobScheduler(
+    jobId,
     {
-      jobId,
-      repeat: {
-        pattern: `${parseInt(minute, 10)} ${parseInt(hour, 10)} * * *`,
-        tz: clientConfig.schedule_timezone || 'Australia/Melbourne'
-      }
+      pattern: `${parseInt(minute, 10)} ${parseInt(hour, 10)} * * *`,
+      tz: clientConfig.schedule_timezone || 'Australia/Melbourne'
+    },
+    {
+      name: 'scheduled-check',
+      data: { clientId: clientConfig.id }
     }
   );
 }
