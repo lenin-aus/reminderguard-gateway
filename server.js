@@ -10,6 +10,7 @@ const tokenManager = require('./tokenManager');
 const { encrypt, decrypt } = require('./crypto');
 const { isConfigComplete } = require('./config');
 const { createSession, resolveSession, startSessionCleanupJob } = require('./session');
+const { registerAllRepeatableJobs } = require('./scheduler');
 
 const app = express();
 app.use(express.json());
@@ -27,6 +28,18 @@ const N8N_API_KEY = process.env.N8N_API_KEY;
 const FASTLEDGER_URL = process.env.FASTLEDGER_URL;
 
 const autoStatementsQueue = new Queue('auto-statements', {
+  connection: {
+    host: process.env.REDIS_HOST,
+    port: process.env.REDIS_PORT || 6379,
+    username: process.env.REDIS_USERNAME,
+    password: process.env.REDIS_PASSWORD
+  }
+});
+
+// Dedicated queue for the daily per-client schedule check (see scheduler.js /
+// scheduledCheckWorker.js) — kept separate from autoStatementsQueue above,
+// which carries the actual send jobs.
+const schedulerQueue = new Queue('auto-statements-scheduler', {
   connection: {
     host: process.env.REDIS_HOST,
     port: process.env.REDIS_PORT || 6379,
@@ -535,6 +548,9 @@ app.post('/webhooks/xero', express.raw({ type: '*/*' }), async (req, res) => {
 });
 
 startSessionCleanupJob();
+registerAllRepeatableJobs(schedulerQueue).catch((e) =>
+  console.error('[Scheduler] Failed to register repeatable jobs at boot:', e.message)
+);
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`Gateway listening on port ${PORT}`));
