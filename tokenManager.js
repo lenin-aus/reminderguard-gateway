@@ -1,9 +1,13 @@
 const pool = require('./db');
 const { encrypt, decrypt } = require('./crypto');
 const { refreshAccessToken } = require('./xero');
+const Redis = require('ioredis');
+const config = require('./config');
+
+const redis = new Redis(config.redisConnectionString);
+const inFlightRefreshes = new Map();
 
 const EXPIRY_BUFFER_MS = 2 * 60 * 1000;
-const STALE_LOCK_MS = 30 * 1000;
 const POLL_INTERVAL_MS = 500;
 const MAX_POLL_ATTEMPTS = 10;
 
@@ -46,11 +50,7 @@ async function getConnection(connectionId) {
   return rows[0] || null;
 }
 
-// Called only when Xero confirms the refresh token itself is dead (invalid_grant) —
-// i.e. the client disconnected the app in Xero. Nulls stored tokens so future
-// attempts fail fast instead of retrying a token that will never work again.
-// Deliberately does NOT touch oauth_tokens (breaks Branch A reconnect matching)
-// or sessions (client should still see a clear "reconnect" message, not be logged out).
+// Called only when Xero confirms the refresh token itself is dead (invalid_grant)
 async function markConnectionRevoked(connectionId) {
   await pool.query(
     `UPDATE connections SET access_token = NULL, refresh_token = NULL, is_refreshing = false, updated_at = now()
@@ -68,8 +68,88 @@ async function saveRefreshedTokens(connectionId, tokenResponse) {
   );
 }
 
-// Returns { accessToken, tenantId } for a given client_id.
-// Refresh locking is keyed on connection_id — safe when many clients share one connection (practice model).
+// New architecture method: Returns raw access token string, protected by in-flight Promise cache and distributed Redis lock
+async function getValidXeroToken(clientId) {
+  if (inFlightRefreshes.has(clientId)) {
+    return inFlightRefreshes.get(clientId);
+  }
+
+  const promise = (async () => {
+    const mapping = await getMapping(clientId);
+    if (!mapping) {
+      const err = new Error('Client is not linked to any Xero connection yet.');
+      err.code = 'NOT_CONNECTED';
+      throw err;
+    }
+
+    const connectionId = mapping.connection_id;
+    const lockKey = `lock:xero:token:${connectionId}`;
+
+    try {
+      // Distributed Redis Lock (Prevents concurrent refresh race conditions across worker processes)[cite: 3]
+      const acquired = await redis.set(lockKey, 'locked', 'NX', 'EX', 15);
+
+      let conn = await getConnection(connectionId);
+      if (!conn) {
+        const err = new Error('Linked connection no longer exists.');
+        err.code = 'CONNECTION_MISSING';
+        throw err;
+      }
+
+      if (!conn.access_token || !conn.refresh_token) {
+        const err = new Error('Xero connection was disconnected by the client. Reconnect required.');
+        err.code = 'RECONNECT_REQUIRED';
+        throw err;
+      }
+
+      const expiryTime = new Date(conn.expiry_time);
+      const isExpiringSoon = expiryTime.getTime() - Date.now() < EXPIRY_BUFFER_MS;
+
+      if (!isExpiringSoon) {
+        if (acquired) await redis.del(lockKey);
+        return decrypt(conn.access_token);
+      }
+
+      if (!acquired) {
+        // Poll for refreshed token if another worker/process holds the lock
+        for (let i = 0; i < MAX_POLL_ATTEMPTS; i++) {
+          await sleep(POLL_INTERVAL_MS);
+          conn = await getConnection(connectionId);
+          if (conn && new Date(conn.expiry_time).getTime() - Date.now() >= EXPIRY_BUFFER_MS) {
+            return decrypt(conn.access_token);
+          }
+        }
+        throw new Error(`Timeout waiting for concurrent token refresh, connection ${connectionId}`);
+      }
+
+      try {
+        const refreshed = await refreshAccessToken(decrypt(conn.refresh_token));
+        await saveRefreshedTokens(connectionId, refreshed);
+        await redis.del(lockKey);
+        return refreshed.access_token;
+      } catch (e) {
+        if (e.xeroError === 'invalid_grant') {
+          await markConnectionRevoked(connectionId);
+          await redis.del(lockKey);
+          const err = new Error('Xero connection was disconnected by the client. Reconnect required.');
+          err.code = 'RECONNECT_REQUIRED';
+          throw err;
+        }
+        await redis.del(lockKey);
+        const err = new Error(`Token refresh failed for connection ${connectionId}: ${e.message}`);
+        err.code = 'REFRESH_FAILED';
+        throw err;
+      }
+    } finally {
+      inFlightRefreshes.delete(clientId);
+    }
+  })();
+
+  inFlightRefreshes.set(clientId, promise);
+  return promise;
+}
+
+// Backward-compatible wrapper returning { accessToken, tenantId }
 async function getValidToken(clientId) {
   const mapping = await getMapping(clientId);
   if (!mapping) {
@@ -77,69 +157,17 @@ async function getValidToken(clientId) {
     err.code = 'NOT_CONNECTED';
     throw err;
   }
-
-  const connectionId = mapping.connection_id;
-  let conn = await getConnection(connectionId);
-  if (!conn) {
-    const err = new Error('Linked connection no longer exists.');
-    err.code = 'CONNECTION_MISSING';
-    throw err;
-  }
-
-  if (!conn.access_token || !conn.refresh_token) {
-    // Already marked dead by a previous failed refresh attempt — fail fast, no point retrying.
-    const err = new Error('Xero connection was disconnected by the client. Reconnect required.');
-    err.code = 'RECONNECT_REQUIRED';
-    throw err;
-  }
-
-  const isExpiringSoon = new Date(conn.expiry_time).getTime() - Date.now() < EXPIRY_BUFFER_MS;
-
-  if (!isExpiringSoon) {
-    return { accessToken: decrypt(conn.access_token), tenantId: mapping.xero_tenant_id };
-  }
-
-  const lockResult = await pool.query(
-    `UPDATE connections
-     SET is_refreshing = true, refresh_locked_at = now()
-     WHERE id = $1
-       AND (is_refreshing = false OR refresh_locked_at < now() - interval '${STALE_LOCK_MS / 1000} seconds')
-     RETURNING *`,
-    [connectionId]
-  );
-
-  if (lockResult.rows.length > 0) {
-    const lockedConn = lockResult.rows[0];
-    try {
-      const refreshed = await refreshAccessToken(decrypt(lockedConn.refresh_token));
-      await saveRefreshedTokens(connectionId, refreshed);
-      return { accessToken: refreshed.access_token, tenantId: mapping.xero_tenant_id };
-    } catch (e) {
-      if (e.xeroError === 'invalid_grant') {
-        // Client disconnected the app in Xero — this refresh token will never work again.
-        await markConnectionRevoked(connectionId);
-        const err = new Error('Xero connection was disconnected by the client. Reconnect required.');
-        err.code = 'RECONNECT_REQUIRED';
-        throw err;
-      }
-      await pool.query('UPDATE connections SET is_refreshing = false WHERE id = $1', [connectionId]);
-      const err = new Error(`Token refresh failed for connection ${connectionId}: ${e.message}`);
-      err.code = 'REFRESH_FAILED';
-      throw err;
-    }
-  }
-
-  // Someone else (possibly a different client under the same connection) is refreshing — poll
-  for (let i = 0; i < MAX_POLL_ATTEMPTS; i++) {
-    await sleep(POLL_INTERVAL_MS);
-    conn = await getConnection(connectionId);
-    if (!conn.is_refreshing) {
-      return { accessToken: decrypt(conn.access_token), tenantId: mapping.xero_tenant_id };
-    }
-  }
-  const err = new Error(`Timed out waiting for concurrent token refresh, connection ${connectionId}`);
-  err.code = 'REFRESH_TIMEOUT';
-  throw err;
+  const accessToken = await getValidXeroToken(clientId);
+  return { accessToken, tenantId: mapping.xero_tenant_id };
 }
 
-module.exports = { createConnection, linkClientToConnection, getMapping, getConnection, getValidToken, saveRefreshedTokens, markConnectionRevoked };
+module.exports = { 
+  createConnection, 
+  linkClientToConnection, 
+  getMapping, 
+  getConnection, 
+  getValidToken, 
+  getValidXeroToken,
+  saveRefreshedTokens, 
+  markConnectionRevoked 
+};
