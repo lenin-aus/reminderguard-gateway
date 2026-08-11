@@ -3,7 +3,6 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
-const axios = require('axios');
 const { Queue } = require('bullmq');
 const pool = require('./db');
 const xero = require('./xero');
@@ -12,12 +11,7 @@ const { encrypt, decrypt } = require('./crypto');
 const { isConfigComplete } = require('./config');
 const { createSession, resolveSession, startSessionCleanupJob } = require('./session');
 const { registerAllRepeatableJobs, registerRepeatableJob } = require('./scheduler');
-const Redis = require('ioredis');
-const config = require('./config');
-const { getTenantTodayDateString, getOrFetchBaseCurrency } = require('./xero');
-const autoStatementsQueue = require('./autoStatementsQueue');
 
-const redis = new Redis(config.redisConnectionString);
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -29,9 +23,22 @@ const SELF_SERVE_SETUP_WIZARD_URL = process.env.SELF_SERVE_SETUP_WIZARD_URL;
 const SELF_SERVE_DASHBOARD_URL = process.env.SELF_SERVE_DASHBOARD_URL;
 const N8N_NIGHTLY_REPORT_URL = process.env.N8N_NIGHTLY_REPORT_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY;
+// fastledger is a second Appsmith app consuming this same Gateway — its
+// post-connect destination, set alongside the other SELF_SERVE_*_URL vars.
 const FASTLEDGER_URL = process.env.FASTLEDGER_URL;
 
-// Dedicated queue for the daily per-client schedule check
+const autoStatementsQueue = new Queue('auto-statements', {
+  connection: {
+    host: process.env.REDIS_HOST,
+    port: process.env.REDIS_PORT || 6379,
+    username: process.env.REDIS_USERNAME,
+    password: process.env.REDIS_PASSWORD
+  }
+});
+
+// Dedicated queue for the daily per-client schedule check (see scheduler.js /
+// scheduledCheckWorker.js) — kept separate from autoStatementsQueue above,
+// which carries the actual send jobs.
 const schedulerQueue = new Queue('auto-statements-scheduler', {
   connection: {
     host: process.env.REDIS_HOST,
@@ -48,6 +55,9 @@ function decodeState(b64) {
   return JSON.parse(Buffer.from(b64, 'base64url').toString('utf8'));
 }
 
+// Resolves where a self-serve login should land after connecting, based on
+// which app it came from (returnApp) and whether onboarding is complete.
+// Shared by /oauth/callback and /oauth/select-org so both paths agree.
 function resolveDestination(returnApp, complete) {
   if (returnApp === 'fastledger') return FASTLEDGER_URL;
   return complete ? SELF_SERVE_DASHBOARD_URL : SELF_SERVE_SETUP_WIZARD_URL;
@@ -70,7 +80,7 @@ app.get('/oauth/connect', (req, res) => {
   res.redirect(xero.buildAuthUrl(state));
 });
 
-// ── Practice: one bookkeeper authorizes access to MANY orgs ─
+// ── Practice: one bookkeeper (e.g. Marissa) authorizes access to MANY orgs ─
 app.get('/oauth/connect-practice', (req, res) => {
   const ownerLabel = req.query.owner_label || 'Practice';
   const nonce = crypto.randomBytes(16).toString('hex');
@@ -90,7 +100,7 @@ app.get('/oauth/callback', async (req, res) => {
 
   if (error) {
     let mode = null;
-    try { mode = decodeState(state).mode; } catch (_) { /* fall through */ }
+    try { mode = decodeState(state).mode; } catch (_) { /* fall through to default */ }
     res.clearCookie('oauth_state');
     if (mode === 'practice') {
       return res.status(400).send(`<h2>Access denied.</h2><p>Xero returned: ${error}</p>`);
@@ -139,7 +149,7 @@ app.get('/oauth/callback', async (req, res) => {
         <ul>${matched.map((m) => `<li>${m}</li>`).join('') || '<li>None</li>'}</ul>
         <p><strong>Unmatched orgs (${unmatched.length}) — no client_config row found for these:</strong></p>
         <ul>${unmatched.map((m) => `<li>${m}</li>`).join('') || '<li>None</li>'}</ul>
-        <p>Unmatched orgs need a client_config row created then re-run this connect flow, or link manually.</p>
+        <p>Unmatched orgs need a client_config row created (matching client_name or xero_tenant_id) then re-run this connect flow, or link manually.</p>
       `;
       return res.send(html);
     }
@@ -347,162 +357,25 @@ app.post('/trigger/nightly-report/:clientId', async (req, res) => {
   }
 });
 
-// ── GET Dashboard Route (Multi-currency Bucket Formatting & Batching) ─────
-app.get('/statements/customers/:clientId', async (req, res) => {
-    try {
-        const { clientId } = req.params;
-        const token = await tokenManager.getValidXeroToken(clientId);
-        const { rows: configRows } = await pool.query('SELECT xero_tenant_id FROM client_config WHERE id = $1', [clientId]);
-        const tenantId = configRows[0].xero_tenant_id;
+// ── Self-serve Auto Statements trigger — BullMQ, replaces old n8n forwarder ─
+app.post('/trigger/auto-statements/:clientId', resolveSession, async (req, res) => {
+  const { clientId } = req.params;
+  const { contactIds } = req.body;
 
-        // Fetch invoices
-        const invoicesRes = await axios.get('https://api.xero.com/api.xro/2.0/Invoices?Statuses=AUTHORISED&Type=ACCREC', {
-            headers: { 'Authorization': `Bearer ${token}`, 'xero-tenant-id': tenantId, 'Accept': 'application/json' }
-        });
+  if (String(req.client_id) !== String(clientId)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  if (!Array.isArray(contactIds) || contactIds.length === 0) {
+    return res.status(400).json({ error: 'No contacts selected' });
+  }
 
-        const buckets = {};
-        for (const inv of invoicesRes.data.Invoices) {
-            // Skip amountDue <= 0
-            if (inv.AmountDue <= 0) continue; 
-            
-            // Bucket by contactId_invoiceCurrency
-            const contactId = inv.Contact.ContactID;
-            const currency = inv.CurrencyCode;
-            const bucketKey = config.BUCKET_KEY_FORMAT(contactId, currency);
-            
-            if (!buckets[bucketKey]) {
-                buckets[bucketKey] = { bucketKey, contactId, contactName: inv.Contact.Name, currency, totalDue: 0, invoices: [] };
-            }
-            buckets[bucketKey].totalDue += inv.AmountDue;
-            buckets[bucketKey].invoices.push(inv);
-        }
-
-        // Batch Xero contact fetch (max 30) preserving hasEmail
-        const contactIds = [...new Set(Object.values(buckets).map(b => b.contactId))];
-        const contactEmailMap = {};
-        
-        for (let i = 0; i < contactIds.length; i += 30) {
-            const batch = contactIds.slice(i, i + 30);
-            const contactsRes = await axios.get(`https://api.xero.com/api.xro/2.0/Contacts?IDs=${batch.join(',')}`, {
-                headers: { 'Authorization': `Bearer ${token}`, 'xero-tenant-id': tenantId, 'Accept': 'application/json' }
-            });
-            for (const contact of contactsRes.data.Contacts) {
-                contactEmailMap[contact.ContactID] = !!contact.EmailAddress;
-            }
-        }
-
-        // Compute lastSent via SELECT DISTINCT ON (bucket_key)
-        const { rows: logs } = await pool.query(`
-            SELECT DISTINCT ON (bucket_key) bucket_key, status, created_at 
-            FROM statement_logs 
-            WHERE client_id = $1 
-            ORDER BY bucket_key, created_at DESC
-        `, [clientId]);
-
-        const logMap = logs.reduce((acc, log) => { acc[log.bucket_key] = log; return acc; }, {});
-
-        const results = Object.values(buckets).map(b => ({
-            ...b,
-            hasEmail: contactEmailMap[b.contactId] || false,
-            lastSent: logMap[b.bucketKey] ? logMap[b.bucketKey].created_at : null,
-            status: logMap[b.bucketKey] ? logMap[b.bucketKey].status : null
-        }));
-
-        res.json(results);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Internal Server Error' });
-    }
-});
-
-// ── POST Trigger Route (Multi-currency bucketKeys, Redis mget & Idempotency) ──
-app.post('/trigger/auto-statements/:clientId', async (req, res) => {
-    try {
-        const { clientId } = req.params;
-        const { bucketKeys } = req.body; 
-        
-        if (!Array.isArray(bucketKeys) || bucketKeys.length === 0) {
-            return res.status(400).json({ error: 'bucketKeys array is required' });
-        }
-
-        // Dedupe
-        const uniqueBucketKeys = [...new Set(bucketKeys)];
-        
-        // Compute base_currency and todayDateString once
-        const baseCurrency = await getOrFetchBaseCurrency(clientId);
-        const todayDateString = getTenantTodayDateString();
-
-        // Execute batch Redis mget() for idempotency
-        const mgetKeys = uniqueBucketKeys.map(bk => `sent-statement:${clientId}:${bk}:${todayDateString}`);
-        const existingLocks = await redis.mget(mgetKeys);
-
-        const keysToProcess = uniqueBucketKeys.filter((_, idx) => !existingLocks[idx]);
-
-        if (keysToProcess.length === 0) {
-            return res.status(202).json({ message: 'All requested statements are already processing or sent today' });
-        }
-
-        const jobsToAdd = [];
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            for (const bucketKey of keysToProcess) {
-                const [contactId, currencyCode] = bucketKey.split('_');
-                
-                // Bulk-insert PROCESSING rows returning log_id per row
-                const { rows } = await client.query(`
-                    INSERT INTO statement_logs 
-                    (client_id, contact_id, bucket_key, currency_code, trigger_type, status) 
-                    VALUES ($1, $2, $3, $4, 'MANUAL', 'PROCESSING') 
-                    RETURNING id
-                `, [clientId, contactId, bucketKey, currencyCode]);
-                
-                const logId = rows[0].id;
-                
-                // Payload strictly includes logId
-                jobsToAdd.push({
-                    name: `statement_${bucketKey}`,
-                    data: { clientId, bucketKey, logId, triggerType: 'MANUAL' },
-                    opts: { jobId: `manual_${logId}_${bucketKey}` }
-                });
-            }
-            await client.query('COMMIT');
-        } catch (e) {
-            await client.query('ROLLBACK');
-            throw e;
-        } finally {
-            client.release();
-        }
-
-        // Await addBulk() before 202 Accepted
-        if (jobsToAdd.length > 0) {
-            await autoStatementsQueue.addBulk(jobsToAdd);
-        }
-
-        res.status(202).json({ message: 'Statements queued successfully', count: jobsToAdd.length });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Internal Server Error' });
-    }
-});
-
-// ── GET /statement-logs (Sent Items bounded query) ────────────────────────
-app.get('/statement-logs/:clientId', async (req, res) => {
-    try {
-        const { rows } = await pool.query(`
-            SELECT id, trigger_type, recipient_name, recipient_email, status, error_reason, error_message, created_at 
-            FROM statement_logs 
-            WHERE client_id = $1 
-              AND created_at >= NOW() - INTERVAL '90 days' 
-            ORDER BY created_at DESC 
-            LIMIT 500
-        `, [req.params.clientId]);
-        
-        res.json(rows);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Internal Server Error' });
-    }
+  try {
+    const job = await autoStatementsQueue.add('send-statements', { clientId, contactIds });
+    return res.json({ success: true, jobId: job.id, message: `Queued statements for ${contactIds.length} contact(s).` });
+  } catch (e) {
+    console.error('Trigger auto-statements error:', e);
+    return res.status(500).json({ error: 'Failed to queue statements job' });
+  }
 });
 
 // ── Generic Xero API proxy ──────────────────────────────────────────────
@@ -542,6 +415,129 @@ app.all('/proxy/xero/:clientId/*', async (req, res) => {
     if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
     if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
     res.status(502).json({ error: e.message, code: e.code || 'PROXY_ERROR' });
+  }
+});
+
+// ── Self-serve Auto Statements customer list ──────────────────────────────
+app.get('/clients/:clientId/statements/customers', resolveSession, async (req, res) => {
+  const { clientId } = req.params;
+
+  if (String(req.client_id) !== String(clientId)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  try {
+    const { accessToken, tenantId } = await tokenManager.getValidToken(clientId);
+
+    const invoicesRes = await fetch(
+      'https://api.xero.com/api.xro/2.0/Invoices?Statuses=AUTHORISED&summaryOnly=false',
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Xero-tenant-id': tenantId,
+          Accept: 'application/json',
+        },
+      }
+    );
+    const invoicesData = await invoicesRes.json();
+    if (!invoicesRes.ok) {
+      return res.status(502).json({ error: 'Xero request failed', detail: invoicesData });
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    function parseXeroDate(dateVal) {
+      if (!dateVal) return null;
+      if (typeof dateVal === 'string' && dateVal.startsWith('/Date(')) {
+        const ms = parseInt(dateVal.replace('/Date(', '').replace(/[^0-9]/g, ''));
+        return new Date(ms);
+      }
+      const d = new Date(dateVal);
+      return isNaN(d.getTime()) ? null : d;
+    }
+
+    function daysDiff(date) {
+      if (!date) return 0;
+      return Math.floor((today - date) / (1000 * 60 * 60 * 24));
+    }
+
+    const allInvoices = invoicesData.Invoices || [];
+    const buckets = {};
+
+    for (const inv of allInvoices) {
+      if (inv.Type !== 'ACCREC') continue;
+
+      const contact = inv.Contact || {};
+      const contactId = contact.ContactID;
+      if (!contactId) continue;
+
+      const amountDue = parseFloat(inv.AmountDue) || 0;
+      if (amountDue <= 0) continue;
+
+      if (inv.CurrencyCode && inv.CurrencyCode !== 'AUD') continue;
+
+      if (!buckets[contactId]) {
+        buckets[contactId] = {
+          contactId,
+          contactName: contact.Name || contactId,
+          hasEmail: false,
+          theyOwe: 0,
+          overdueAmount: 0,
+          daysOverdue: 0,
+        };
+      }
+
+      const bucket = buckets[contactId];
+      const dueDate = parseXeroDate(inv.DueDateString || inv.DueDate);
+      const daysOverdueForInvoice = dueDate ? Math.max(0, daysDiff(dueDate)) : 0;
+
+      bucket.theyOwe += amountDue;
+      if (daysOverdueForInvoice > 0) {
+        bucket.overdueAmount += amountDue;
+      }
+      if (daysOverdueForInvoice > bucket.daysOverdue) {
+        bucket.daysOverdue = daysOverdueForInvoice;
+      }
+    }
+
+    const contactIds = Object.keys(buckets);
+
+    await Promise.all(
+      contactIds.map(async (contactId) => {
+        try {
+          const contactRes = await fetch(
+            `https://api.xero.com/api.xro/2.0/Contacts/${contactId}`,
+            {
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                'Xero-tenant-id': tenantId,
+                Accept: 'application/json',
+              },
+            }
+          );
+          const contactData = await contactRes.json();
+          const xeroContact = (contactData.Contacts || [])[0] || {};
+          const email = (xeroContact.EmailAddress || '').trim();
+          buckets[contactId].hasEmail = email.length > 0;
+        } catch (e) {
+          buckets[contactId].hasEmail = false;
+        }
+      })
+    );
+
+    const customers = Object.values(buckets).map((b) => ({
+      ...b,
+      theyOwe: parseFloat(b.theyOwe.toFixed(2)),
+      overdueAmount: parseFloat(b.overdueAmount.toFixed(2)),
+    }));
+
+    res.json({ customers });
+  } catch (e) {
+    console.error('Statements customers error:', e);
+    if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
+    if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
+    res.status(502).json({ error: e.message, code: e.code || 'GATEWAY_ERROR' });
   }
 });
 
