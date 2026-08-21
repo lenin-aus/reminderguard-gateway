@@ -11,6 +11,7 @@ const { encrypt, decrypt } = require('./crypto');
 const { isConfigComplete } = require('./config');
 const { createSession, resolveSession, startSessionCleanupJob } = require('./session');
 const { registerAllRepeatableJobs, registerRepeatableJob } = require('./scheduler');
+const { getOrFetchBaseCurrency, getTenantTodayDateString } = require('./shared');
 
 const app = express();
 app.use(express.json());
@@ -62,6 +63,26 @@ function resolveDestination(returnApp, complete) {
   if (returnApp === 'fastledger') return FASTLEDGER_URL;
   return complete ? SELF_SERVE_DASHBOARD_URL : SELF_SERVE_SETUP_WIZARD_URL;
 }
+
+// If this client_id's stored xero_tenant_id differs from the tenant they just
+// reconnected to, null out base_currency so getOrFetchBaseCurrency() re-fetches
+// fresh instead of silently keeping the previous org's currency.
+async function nullBaseCurrencyIfTenantChanged(clientId, newTenantId) {
+  const { rows } = await pool.query(
+    'SELECT xero_tenant_id FROM client_config WHERE id = $1',
+    [clientId]
+  );
+  const storedTenantId = rows[0]?.xero_tenant_id;
+  if (storedTenantId && storedTenantId !== newTenantId) {
+    await pool.query('UPDATE client_config SET base_currency = NULL WHERE id = $1', [clientId]);
+  }
+}
+
+// bucketKey format contract: ${contactId}_${currencyCode}, currency always
+// exactly 3 uppercase chars. Constructed here in the GET route below and
+// deconstructed via BUCKET_KEY_REGEX in the POST trigger route further down —
+// if this format ever changes, both sites must be updated together.
+const BUCKET_KEY_REGEX = /^(.+)_([A-Za-z]{3})$/;
 
 // ── Health check ──────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
@@ -190,6 +211,7 @@ app.get('/oauth/callback', async (req, res) => {
       if (existing.rows.length > 0) {
         clientId = existing.rows[0].client_id;
         await tokenManager.saveRefreshedTokens(existing.rows[0].connection_id, tokenResponse);
+        await nullBaseCurrencyIfTenantChanged(clientId, tenantId);
       } else {
         try {
           const c = await pool.query(
@@ -207,6 +229,7 @@ app.get('/oauth/callback', async (req, res) => {
             );
             clientId = retry.rows[0].client_id;
             await tokenManager.saveRefreshedTokens(retry.rows[0].connection_id, tokenResponse);
+            await nullBaseCurrencyIfTenantChanged(clientId, tenantId);
           } else {
             throw e;
           }
@@ -272,6 +295,7 @@ app.post('/oauth/select-org', async (req, res) => {
     if (existing.rows.length > 0) {
       clientId = existing.rows[0].client_id;
       await tokenManager.saveRefreshedTokens(existing.rows[0].connection_id, tokenResponse);
+      await nullBaseCurrencyIfTenantChanged(clientId, tenantId);
     } else {
       try {
         const c = await pool.query(
@@ -289,6 +313,7 @@ app.post('/oauth/select-org', async (req, res) => {
           );
           clientId = retry.rows[0].client_id;
           await tokenManager.saveRefreshedTokens(retry.rows[0].connection_id, tokenResponse);
+          await nullBaseCurrencyIfTenantChanged(clientId, tenantId);
         } else {
           throw e;
         }
@@ -360,18 +385,90 @@ app.post('/trigger/nightly-report/:clientId', async (req, res) => {
 // ── Self-serve Auto Statements trigger — BullMQ, replaces old n8n forwarder ─
 app.post('/trigger/auto-statements/:clientId', resolveSession, async (req, res) => {
   const { clientId } = req.params;
-  const { contactIds } = req.body;
+  const { bucketKeys } = req.body;
 
   if (String(req.client_id) !== String(clientId)) {
     return res.status(403).json({ error: 'Forbidden' });
   }
-  if (!Array.isArray(contactIds) || contactIds.length === 0) {
-    return res.status(400).json({ error: 'No contacts selected' });
+  if (!Array.isArray(bucketKeys) || bucketKeys.length === 0) {
+    return res.status(400).json({ error: "Invalid payload. 'bucketKeys' array is required." });
+  }
+
+  const uniqueBucketKeys = [...new Set(bucketKeys)];
+
+  const parsed = [];
+  for (const bucketKey of uniqueBucketKeys) {
+    const match = bucketKey.match(BUCKET_KEY_REGEX);
+    if (!match) {
+      return res.status(400).json({ error: `Invalid bucketKey format: ${bucketKey}` });
+    }
+    const [, contactId, currencyCode] = match;
+    parsed.push({ bucketKey, contactId, currencyCode: currencyCode.toUpperCase() });
   }
 
   try {
-    const job = await autoStatementsQueue.add('send-statements', { clientId, contactIds });
-    return res.json({ success: true, jobId: job.id, message: `Queued statements for ${contactIds.length} contact(s).` });
+    const baseCurrency = await getOrFetchBaseCurrency(clientId);
+    const todayDateString = getTenantTodayDateString();
+
+    // Batch idempotency pre-check (optimization only — the worker's atomic
+    // SET NX lock is the actual duplicate-prevention mechanism).
+    const redisKeys = parsed.map((p) => `sent-statement:${clientId}:${p.bucketKey}:${todayDateString}`);
+    const sentFlags = redisKeys.length > 0 ? await autoStatementsQueue.client.mget(redisKeys) : [];
+
+    const toEnqueue = parsed.filter((_, i) => !sentFlags[i]);
+    if (toEnqueue.length === 0) {
+      return res.status(202).json({ success: true, queuedCount: 0, message: 'All selected statements already sent today.' });
+    }
+
+    // Bulk-insert PROCESSING rows now, not left to the worker at execution
+    // start — closes the gap where a queued-but-not-yet-picked-up job would
+    // show no row at all while waiting on the limiter/concurrency caps.
+    const insertValues = [];
+    const insertParams = [];
+    let paramIndex = 1;
+    for (const p of toEnqueue) {
+      insertValues.push(`($${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++}, $${paramIndex++}, 'PROCESSING')`);
+      insertParams.push(clientId, p.contactId, p.bucketKey, p.currencyCode, 'manual');
+    }
+    const { rows: insertedLogs } = await pool.query(
+      `INSERT INTO statement_logs (client_id, contact_id, bucket_key, currency_code, trigger_type, status)
+       VALUES ${insertValues.join(', ')}
+       RETURNING id, bucket_key`,
+      insertParams
+    );
+    const logIdByBucketKey = {};
+    for (const row of insertedLogs) {
+      logIdByBucketKey[row.bucket_key] = row.id;
+    }
+
+    const minuteWindow = Math.floor(Date.now() / 60000);
+    const jobs = toEnqueue.map((p) => ({
+      name: 'send-statements',
+      data: {
+        clientId,
+        bucketKey: p.bucketKey,
+        currencyCode: p.currencyCode,
+        contactId: p.contactId,
+        baseCurrency,
+        todayDateString,
+        logId: logIdByBucketKey[p.bucketKey],
+      },
+      opts: {
+        jobId: `send-manual-${clientId}-${p.bucketKey}-${todayDateString}-${minuteWindow}`,
+        backoff: { type: 'lockCollisionDelay' },
+        attempts: 5,
+        removeOnComplete: { age: 86400, count: 100 },
+        removeOnFail: { age: 604800, count: 500 },
+      },
+    }));
+
+    await autoStatementsQueue.addBulk(jobs);
+
+    return res.status(202).json({
+      success: true,
+      queuedCount: toEnqueue.length,
+      message: `Queued statements for ${toEnqueue.length} recipient(s).`,
+    });
   } catch (e) {
     console.error('Trigger auto-statements error:', e);
     return res.status(500).json({ error: 'Failed to queue statements job' });
@@ -428,6 +525,7 @@ app.get('/clients/:clientId/statements/customers', resolveSession, async (req, r
 
   try {
     const { accessToken, tenantId } = await tokenManager.getValidToken(clientId);
+    const baseCurrency = await getOrFetchBaseCurrency(clientId);
 
     const invoicesRes = await fetch(
       'https://api.xero.com/api.xro/2.0/Invoices?Statuses=AUTHORISED&summaryOnly=false',
@@ -462,6 +560,16 @@ app.get('/clients/:clientId/statements/customers', resolveSession, async (req, r
       return Math.floor((today - date) / (1000 * 60 * 60 * 24));
     }
 
+    // NFD-normalize + strip diacritics + replace invalid filename chars, so a
+    // customer with no ASCII-safe name still gets a stable, unique bucketKey.
+    function sanitizeForKey(str) {
+      return (str || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .replace(/^_+|_+$/g, '');
+    }
+
     const allInvoices = invoicesData.Invoices || [];
     const buckets = {};
 
@@ -475,12 +583,15 @@ app.get('/clients/:clientId/statements/customers', resolveSession, async (req, r
       const amountDue = parseFloat(inv.AmountDue) || 0;
       if (amountDue <= 0) continue;
 
-      if (inv.CurrencyCode && inv.CurrencyCode !== 'AUD') continue;
+      const invoiceCurrency = (inv.CurrencyCode || baseCurrency || 'AUD').toUpperCase();
+      const bucketKey = `${contactId}_${invoiceCurrency}` || `fallback_${contactId || Math.random().toString(36).slice(2)}`;
 
-      if (!buckets[contactId]) {
-        buckets[contactId] = {
+      if (!buckets[bucketKey]) {
+        buckets[bucketKey] = {
+          bucketKey,
           contactId,
           contactName: contact.Name || contactId,
+          currencyCode: invoiceCurrency,
           hasEmail: false,
           theyOwe: 0,
           overdueAmount: 0,
@@ -488,7 +599,7 @@ app.get('/clients/:clientId/statements/customers', resolveSession, async (req, r
         };
       }
 
-      const bucket = buckets[contactId];
+      const bucket = buckets[bucketKey];
       const dueDate = parseXeroDate(inv.DueDateString || inv.DueDate);
       const daysOverdueForInvoice = dueDate ? Math.max(0, daysDiff(dueDate)) : 0;
 
@@ -501,35 +612,86 @@ app.get('/clients/:clientId/statements/customers', resolveSession, async (req, r
       }
     }
 
-    const contactIds = Object.keys(buckets);
+    // Dedupe contactIds before batching /Contacts?IDs=... — a customer can
+    // appear as multiple bucketKeys (one per currency) but should only be
+    // looked up once.
+    const uniqueContactIds = [...new Set(Object.values(buckets).map((b) => b.contactId))];
+    const emailByContactId = {};
 
-    await Promise.all(
-      contactIds.map(async (contactId) => {
-        try {
-          const contactRes = await fetch(
-            `https://api.xero.com/api.xro/2.0/Contacts/${contactId}`,
-            {
-              headers: {
-                Authorization: `Bearer ${accessToken}`,
-                'Xero-tenant-id': tenantId,
-                Accept: 'application/json',
-              },
-            }
-          );
-          const contactData = await contactRes.json();
-          const xeroContact = (contactData.Contacts || [])[0] || {};
-          const email = (xeroContact.EmailAddress || '').trim();
-          buckets[contactId].hasEmail = email.length > 0;
-        } catch (e) {
-          buckets[contactId].hasEmail = false;
+    const CHUNK_SIZE = 30;
+    for (let i = 0; i < uniqueContactIds.length; i += CHUNK_SIZE) {
+      const chunk = uniqueContactIds.slice(i, i + CHUNK_SIZE);
+      try {
+        const contactsRes = await fetch(
+          `https://api.xero.com/api.xro/2.0/Contacts?IDs=${chunk.join(',')}`,
+          {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'Xero-tenant-id': tenantId,
+              Accept: 'application/json',
+            },
+          }
+        );
+        const contactsData = await contactsRes.json();
+        for (const c of contactsData.Contacts || []) {
+          emailByContactId[c.ContactID] = (c.EmailAddress || '').trim().length > 0;
         }
-      })
-    );
+      } catch (e) {
+        // Leave this chunk's contacts as hasEmail: false (default) on failure.
+      }
+    }
+
+    for (const bucket of Object.values(buckets)) {
+      bucket.hasEmail = emailByContactId[bucket.contactId] || false;
+    }
+
+    // Compute "Last sent" per bucketKey from the latest statement_logs row.
+    const bucketKeys = Object.keys(buckets);
+    const lastSentByBucketKey = {};
+    if (bucketKeys.length > 0) {
+      const { rows: logRows } = await pool.query(
+        `SELECT DISTINCT ON (bucket_key) bucket_key, status, error_reason, created_at
+         FROM statement_logs
+         WHERE client_id = $1 AND bucket_key = ANY($2)
+         ORDER BY bucket_key, created_at DESC`,
+        [clientId, bucketKeys]
+      );
+
+      const nowMs = Date.now();
+      const todayStr = getTenantTodayDateString();
+
+      for (const row of logRows) {
+        let lastSent;
+        if (row.status === 'PROCESSING') {
+          const ageMs = nowMs - new Date(row.created_at).getTime();
+          lastSent = ageMs <= 15 * 60 * 1000 ? 'Sending...' : 'Failed';
+        } else if (row.status === 'FAILED') {
+          lastSent = row.error_reason === 'MISSING_EMAIL' ? 'Never' : 'Failed today';
+        } else if (row.status === 'DELIVERED') {
+          const createdDateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Australia/Melbourne' }).format(
+            new Date(row.created_at)
+          );
+          if (createdDateStr === todayStr) {
+            lastSent = 'Today';
+          } else {
+            const daysAgo = Math.max(
+              1,
+              Math.round((nowMs - new Date(row.created_at).getTime()) / (1000 * 60 * 60 * 24))
+            );
+            lastSent = `${daysAgo} day${daysAgo === 1 ? '' : 's'} ago`;
+          }
+        } else {
+          lastSent = 'Never';
+        }
+        lastSentByBucketKey[row.bucket_key] = lastSent;
+      }
+    }
 
     const customers = Object.values(buckets).map((b) => ({
       ...b,
       theyOwe: parseFloat(b.theyOwe.toFixed(2)),
       overdueAmount: parseFloat(b.overdueAmount.toFixed(2)),
+      lastSent: lastSentByBucketKey[b.bucketKey] || 'Never',
     }));
 
     res.json({ customers });
@@ -538,6 +700,31 @@ app.get('/clients/:clientId/statements/customers', resolveSession, async (req, r
     if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
     if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
     res.status(502).json({ error: e.message, code: e.code || 'GATEWAY_ERROR' });
+  }
+});
+
+// ── Sent Items page — bounded audit log ────────────────────────────────────
+app.get('/clients/:clientId/statement-logs', resolveSession, async (req, res) => {
+  const { clientId } = req.params;
+
+  if (String(req.client_id) !== String(clientId)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, trigger_type, recipient_name, recipient_email, status, error_reason, error_message, created_at
+       FROM statement_logs
+       WHERE client_id = $1
+         AND created_at >= NOW() - INTERVAL '90 days'
+       ORDER BY created_at DESC
+       LIMIT 500`,
+      [clientId]
+    );
+    res.json({ logs: rows });
+  } catch (e) {
+    console.error('Statement logs error:', e);
+    res.status(500).json({ error: e.message });
   }
 });
 
