@@ -4,6 +4,7 @@ const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const fetch = require('node-fetch');
 const { Queue } = require('bullmq');
+const Redis = require('ioredis');
 const pool = require('./db');
 const xero = require('./xero');
 const tokenManager = require('./tokenManager');
@@ -47,6 +48,17 @@ const schedulerQueue = new Queue('auto-statements-scheduler', {
     username: process.env.REDIS_USERNAME,
     password: process.env.REDIS_PASSWORD
   }
+});
+
+// Plain Redis connection for direct commands (GET/SET/MGET on the
+// sent-statement:... idempotency keys). BullMQ's Queue instances don't
+// reliably expose a ready-to-use client for this, so this is separate from
+// autoStatementsQueue/schedulerQueue above.
+const redis = new Redis({
+  host: process.env.REDIS_HOST,
+  port: process.env.REDIS_PORT || 6379,
+  username: process.env.REDIS_USERNAME,
+  password: process.env.REDIS_PASSWORD
 });
 
 function encodeState(obj) {
@@ -413,7 +425,7 @@ app.post('/trigger/auto-statements/:clientId', resolveSession, async (req, res) 
     // Batch idempotency pre-check (optimization only — the worker's atomic
     // SET NX lock is the actual duplicate-prevention mechanism).
     const redisKeys = parsed.map((p) => `sent-statement:${clientId}:${p.bucketKey}:${todayDateString}`);
-    const sentFlags = redisKeys.length > 0 ? await autoStatementsQueue.client.mget(redisKeys) : [];
+    const sentFlags = redisKeys.length > 0 ? await redis.mget(redisKeys) : [];
 
     const toEnqueue = parsed.filter((_, i) => !sentFlags[i]);
     if (toEnqueue.length === 0) {
