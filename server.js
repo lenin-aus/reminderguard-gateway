@@ -467,7 +467,7 @@ app.post('/trigger/auto-statements/:clientId', resolveSession, async (req, res) 
       },
       opts: {
         jobId: `send-manual-${clientId}-${p.bucketKey}-${todayDateString}-${minuteWindow}`,
-        backoff: { type: 'lockCollisionDelay' },
+       backoff: { type: 'custom' },
         attempts: 5,
         removeOnComplete: { age: 86400, count: 100 },
         removeOnFail: { age: 604800, count: 500 },
