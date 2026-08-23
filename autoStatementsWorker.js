@@ -438,11 +438,9 @@ const worker = new Worker('auto-statements', async (job) => {
   },
   limiter: { max: 20, duration: 60000 },
   concurrency: 2,
-  settings: {
-    backoffStrategies: {
-      lockCollisionDelay: (attemptsMade, err) => {
-        return err && err.message && err.message.startsWith('LOCK_COLLISION') ? 60000 : 5000;
-      }
+ settings: {
+    backoffStrategy: (attemptsMade, err) => {
+      return err && err.message && err.message.startsWith('LOCK_COLLISION') ? 60000 : 5000;
     }
   }
 });
