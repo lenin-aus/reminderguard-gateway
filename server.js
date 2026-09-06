@@ -11,7 +11,7 @@ const tokenManager = require('./tokenManager');
 const { encrypt, decrypt } = require('./crypto');
 const { isConfigComplete } = require('./config');
 const { createSession, resolveSession, startSessionCleanupJob } = require('./session');
-const { registerAllRepeatableJobs, registerRepeatableJob } = require('./scheduler');
+const { registerHeartbeat } = require('./scheduler');
 const { getOrFetchBaseCurrency, getTenantTodayDateString } = require('./shared');
 
 const app = express();
@@ -740,21 +740,7 @@ app.get('/clients/:clientId/statement-logs', resolveSession, async (req, res) =>
   }
 });
 
-app.post('/clients/:clientId/register-schedule', resolveSession, async (req, res) => {
-  try {
-    const clientId = parseInt(req.params.clientId, 10);
-    const { rows } = await pool.query('SELECT * FROM client_config WHERE id = $1', [clientId]);
-    const clientConfig = rows[0];
-    if (!clientConfig) {
-      return res.status(404).json({ error: 'Client not found' });
-    }
-    await registerRepeatableJob(schedulerQueue, clientConfig);
-    return res.json({ success: true, message: `Schedule registered for client ${clientId}` });
-  } catch (e) {
-    console.error('[register-schedule] Failed:', e.message);
-    return res.status(500).json({ error: 'Failed to register schedule' });
-  }
-});
+
 
 // ── Xero disconnect webhook ─────────────────────────────────────────────
 app.post('/webhooks/xero', express.raw({ type: '*/*' }), async (req, res) => {
@@ -763,8 +749,8 @@ app.post('/webhooks/xero', express.raw({ type: '*/*' }), async (req, res) => {
 });
 
 startSessionCleanupJob();
-registerAllRepeatableJobs(schedulerQueue).catch((e) =>
-  console.error('[Scheduler] Failed to register repeatable jobs at boot:', e.message)
+registerHeartbeat(schedulerQueue).catch((e) =>
+  console.error('[Heartbeat] Failed to register heartbeat job at boot:', e.message)
 );
 
 const PORT = process.env.PORT || 4000;
