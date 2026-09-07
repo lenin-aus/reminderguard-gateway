@@ -3,6 +3,8 @@
 // per client, no timezones here — scheduledCheckWorker.js decides who is due.
 
 
+const HEARTBEAT_JOB_ID = 'auto-statements-heartbeat';
+
 async function registerHeartbeat(schedulerQueue) {
   await schedulerQueue.upsertJobScheduler(
     HEARTBEAT_JOB_ID,
@@ -12,6 +14,7 @@ async function registerHeartbeat(schedulerQueue) {
   console.log('[Heartbeat] Registered global heartbeat job (* * * * *)');
 }
 
+module.exports = { registerHeartbeat };
 
 // const HEARTBEAT_JOB_ID = 'auto-statements-heartbeat';
 
