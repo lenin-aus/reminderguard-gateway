@@ -170,7 +170,7 @@ async function runClient(config) {
         logId: logIdByBucketKey[b.bucketKey]
       },
       opts: {
-        jobId: `send-sched-${clientId}-${b.bucketKey}-${todayDateString}`,
+        jobId: `send-sched-${clientId}-${b.bucketKey}-${scheduledForIso}`,
         backoff: { type: 'custom' },
         attempts: 5,
         removeOnComplete: { age: 86400, count: 100 },
