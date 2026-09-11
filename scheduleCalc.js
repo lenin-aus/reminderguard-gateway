@@ -12,14 +12,20 @@ const WEEKDAY_INDEX = {
 };
 
 // Accepts both storage formats seen in this project:
-// 'the 1st'..'the 5th' / 'the last', and bare 1..5 / 'last'.
+// 'the 1st'..'the 28th' / 'the last', and bare 1..28 / 'last'.
 function parseOrdinal(raw) {
   if (raw === null || raw === undefined) return null;
   const s = String(raw).trim().toLowerCase().replace(/^the\s+/, '');
   if (s === 'last') return 'last';
   const n = parseInt(s, 10);
-  if (Number.isInteger(n) && n >= 1 && n <= 5) return n;
+  if (Number.isInteger(n) && n >= 1 && n <= 28) return n;
   return null;
+}
+
+// ScheduleDay offers the literal 'day' (calendar day-of-month) alongside the
+// seven weekday names.
+function isDayToken(raw) {
+  return String(raw || '').trim().toLowerCase() === 'day';
 }
 
 function parseWeekday(raw) {
@@ -43,11 +49,6 @@ function normalizeConfig(config) {
     throw new Error(`scheduleCalc: invalid schedule_unit "${config.schedule_unit}"`);
   }
 
-  const weekday = parseWeekday(config.schedule_day);
-  if (!weekday) {
-    throw new Error(`scheduleCalc: invalid schedule_day "${config.schedule_day}"`);
-  }
-
   const time = parseTime(config.schedule_time);
   if (!time) {
     throw new Error(`scheduleCalc: invalid schedule_time "${config.schedule_time}"`);
@@ -56,18 +57,42 @@ function normalizeConfig(config) {
   let interval = parseInt(config.schedule_interval, 10);
   if (!Number.isInteger(interval) || interval < 1) interval = 1;
 
-  let ordinal = null;
-  if (unit === 'month') {
-    ordinal = parseOrdinal(config.schedule_ordinal);
-    if (ordinal === null) {
-      throw new Error(`scheduleCalc: invalid schedule_ordinal "${config.schedule_ordinal}" for monthly schedule`);
-    }
-  }
-
   const rawZone = config.schedule_timezone || DEFAULT_ZONE;
   const zone = DateTime.local().setZone(rawZone).isValid ? rawZone : DEFAULT_ZONE;
 
-  return { unit, weekday, ordinal, interval, zone, hour: time.hour, minute: time.minute };
+  const base = { unit, interval, zone, hour: time.hour, minute: time.minute };
+
+  // Weekly always lands on a named weekday. 'day' is meaningless without a
+  // month to count within, and the ordinal is ignored entirely.
+  if (unit === 'week') {
+    const weekday = parseWeekday(config.schedule_day);
+    if (!weekday) {
+      throw new Error(`scheduleCalc: invalid schedule_day "${config.schedule_day}" for weekly schedule`);
+    }
+    return { ...base, mode: 'nthWeekday', weekday, ordinal: null };
+  }
+
+  const ordinal = parseOrdinal(config.schedule_ordinal);
+  if (ordinal === null) {
+    throw new Error(`scheduleCalc: invalid schedule_ordinal "${config.schedule_ordinal}" for monthly schedule`);
+  }
+
+  // Monthly, calendar day: 'the 1st'..'the 28th' is a day number, 'the last'
+  // is the final day of the month.
+  if (isDayToken(config.schedule_day)) {
+    return { ...base, mode: 'dayOfMonth', weekday: null, ordinal };
+  }
+
+  // Monthly, nth weekday. A weekday occurs at most 4-5 times in a month, so
+  // anything past the 4th falls back to the last occurrence. This mirrors the
+  // Appsmith Settings page, which restricts the dropdown the same way — the
+  // fallback here is the safety net for rows saved before that restriction.
+  const weekday = parseWeekday(config.schedule_day);
+  if (!weekday) {
+    throw new Error(`scheduleCalc: invalid schedule_day "${config.schedule_day}"`);
+  }
+  const safeOrdinal = (typeof ordinal === 'number' && ordinal > 4) ? 'last' : ordinal;
+  return { ...base, mode: 'nthWeekday', weekday, ordinal: safeOrdinal };
 }
 
 // Nth (or last) occurrence of a weekday within the month that `dt` falls in.
@@ -87,6 +112,23 @@ function ordinalWeekdayOfMonth(dt, ordinal, weekday, hour, minute) {
   }
 
   return firstOfMonth.set({ day, hour, minute, second: 0, millisecond: 0 });
+}
+
+// Calendar day of the month that `dt` falls in. 'last' resolves to the final
+// day, so 28/29/30/31 depending on the month. Numbers are capped at 28 by
+// parseOrdinal, so the Math.min is belt-and-braces only.
+function dayOfMonthSlot(dt, ordinal, hour, minute) {
+  const firstOfMonth = dt.set({ day: 1 }).startOf('day');
+  const daysInMonth = firstOfMonth.daysInMonth;
+  const day = ordinal === 'last' ? daysInMonth : Math.min(ordinal, daysInMonth);
+  return firstOfMonth.set({ day, hour, minute, second: 0, millisecond: 0 });
+}
+
+// Single entry point for "the slot inside this month", whichever mode applies.
+function monthSlot(c, dt) {
+  return c.mode === 'dayOfMonth'
+    ? dayOfMonthSlot(dt, c.ordinal, c.hour, c.minute)
+    : ordinalWeekdayOfMonth(dt, c.ordinal, c.weekday, c.hour, c.minute);
 }
 
 function toDateTime(value, zone) {
@@ -110,9 +152,9 @@ function advance(c, from, intervalOverride) {
   }
 
   let base = from.plus({ months: interval });
-  let candidate = ordinalWeekdayOfMonth(base, c.ordinal, c.weekday, c.hour, c.minute);
+  let candidate = monthSlot(c, base);
   if (candidate <= from) {
-    candidate = ordinalWeekdayOfMonth(base.plus({ months: 1 }), c.ordinal, c.weekday, c.hour, c.minute);
+    candidate = monthSlot(c, base.plus({ months: 1 }));
   }
   return candidate;
 }
@@ -134,9 +176,9 @@ function computeFirstRun(config, fromDate) {
     return candidate.toUTC().toJSDate();
   }
 
-  let candidate = ordinalWeekdayOfMonth(from, c.ordinal, c.weekday, c.hour, c.minute);
+  let candidate = monthSlot(c, from);
   if (candidate <= from) {
-    candidate = ordinalWeekdayOfMonth(from.plus({ months: 1 }), c.ordinal, c.weekday, c.hour, c.minute);
+    candidate = monthSlot(c, from.plus({ months: 1 }));
   }
   return candidate.toUTC().toJSDate();
 }
@@ -167,4 +209,4 @@ function computeNextRun(config, fromDate) {
   return candidate.toUTC().toJSDate();
 }
 
-module.exports = { computeFirstRun, computeNextRun, normalizeConfig, ordinalWeekdayOfMonth };
+module.exports = { computeFirstRun, computeNextRun, normalizeConfig, ordinalWeekdayOfMonth, dayOfMonthSlot, monthSlot };
