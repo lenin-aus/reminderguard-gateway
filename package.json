@@ -4,7 +4,8 @@
   "description": "Auth Gateway: multi-tenant Xero OAuth token management + API proxy",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "dependencies": {
     "bullmq": "^6.0.8",

@@ -13,6 +13,7 @@ const { isConfigComplete } = require('./config');
 const { createSession, resolveSession, startSessionCleanupJob } = require('./session');
 const { registerHeartbeat } = require('./scheduler');
 const { getOrFetchBaseCurrency, getTenantTodayDateString } = require('./shared');
+const { validateScheduleConfig, toApiConfig, READ_KEYS } = require('./scheduleConfig');
 
 const app = express();
 app.use(express.json());
@@ -741,6 +742,94 @@ app.get('/clients/:clientId/statement-logs', resolveSession, async (req, res) =>
 });
 
 
+
+// ── Auto-statement schedule settings ───────────────────────────────────────
+// Only the whitelisted schedule columns are readable or writable here. The client id always
+// comes from the session (req.client_id), never from the request body.
+const CONFIG_COLUMNS = READ_KEYS.join(', ');
+
+app.get('/clients/:clientId/config', resolveSession, async (req, res) => {
+  if (String(req.client_id) !== String(req.params.clientId)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT ${CONFIG_COLUMNS}, next_run_at FROM client_config WHERE id = $1`,
+      [req.client_id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Client not found' });
+    res.json(toApiConfig(rows[0]));
+  } catch (e) {
+    console.error('Get client config error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.put('/clients/:clientId/config', resolveSession, async (req, res) => {
+  if (String(req.client_id) !== String(req.params.clientId)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  const result = validateScheduleConfig(req.body);
+  if (!result.ok) {
+    return res.status(400).json({
+      error: 'Invalid schedule settings',
+      code: 'VALIDATION_FAILED',
+      fields: result.fields,
+    });
+  }
+  const c = result.value;
+
+  try {
+    // next_run_at is cleared (so the heartbeat backfills it) only when a schedule field
+    // changed. In an UPDATE, the right-hand sides see the row's old values, so the comparison
+    // and the write are one atomic statement. Saving only recipient changes keeps the cadence.
+    const { rows } = await pool.query(
+      `UPDATE client_config SET
+         auto_statements_enabled = $1,
+         schedule_unit = $2,
+         schedule_interval = $3,
+         schedule_day = $4,
+         schedule_ordinal = $5,
+         schedule_time = $6,
+         schedule_timezone = $7,
+         statement_period_end_rule = $8,
+         recipient_list = $9,
+         recipient_filter = $10,
+         recipient_target = $11,
+         next_run_at = CASE
+           WHEN (auto_statements_enabled, schedule_unit, schedule_interval, schedule_day,
+                 schedule_ordinal, schedule_time, schedule_timezone)
+                IS DISTINCT FROM
+                ($1::boolean, $2::text, $3::integer, $4::text, $5::text, $6::text, $7::text)
+           THEN NULL
+           ELSE next_run_at
+         END
+       WHERE id = $12
+       RETURNING ${CONFIG_COLUMNS}, next_run_at`,
+      [
+        c.auto_statements_enabled,
+        c.schedule_unit,
+        c.schedule_interval,
+        c.schedule_day,
+        c.schedule_ordinal,
+        c.schedule_time,
+        c.schedule_timezone,
+        c.statement_period_end_rule,
+        c.recipient_list,
+        c.recipient_filter,
+        c.recipient_target,
+        req.client_id,
+      ]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Client not found' });
+    res.json(toApiConfig(rows[0]));
+  } catch (e) {
+    console.error('Update client config error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 // ── Xero disconnect webhook ─────────────────────────────────────────────
 app.post('/webhooks/xero', express.raw({ type: '*/*' }), async (req, res) => {
