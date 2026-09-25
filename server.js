@@ -489,11 +489,23 @@ app.post('/trigger/auto-statements/:clientId', resolveSession, async (req, res) 
 });
 
 // ── Generic Xero API proxy ──────────────────────────────────────────────
-app.all('/proxy/xero/:clientId/*', async (req, res) => {
+// Requires a session and only serves the session's own client, like every other
+// /clients/:clientId route. Without this, anyone who could guess a client id could
+// read (and, with POST/PUT/DELETE, modify) that client's Xero organisation.
+app.all('/proxy/xero/:clientId/*', resolveSession, async (req, res) => {
   const correlationId = req.headers['x-correlation-id'] || crypto.randomUUID();
   const { clientId } = req.params;
+  if (String(req.client_id) !== String(clientId)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
   const xeroPath = req.params[0];
-  const queryString = req.url.split('?')[1] || '';
+  let queryString = req.url.split('?')[1] || '';
+  if (req.query.token !== undefined) {
+    // resolveSession also accepts ?token=; never forward the session token to Xero.
+    const forwarded = new URLSearchParams(queryString);
+    forwarded.delete('token');
+    queryString = forwarded.toString();
+  }
 
   try {
     const { accessToken, tenantId } = await tokenManager.getValidToken(clientId);
