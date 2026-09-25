@@ -24,11 +24,13 @@ body{font-family:Arial,sans-serif;color:#333;margin:0;padding:0;}
 .meta{display:flex;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:16px;}
 .mb{font-size:13px;line-height:1.8;}
 .mb strong{display:block;font-size:11px;text-transform:uppercase;color:#888;margin-bottom:2px;}
-h2{font-size:15px;margin:28px 0 8px;color:#111;}
+h2{font-size:15px;margin:28px 0 8px;color:#111;page-break-after:avoid;}
 h2 .lbl{font-size:12px;font-weight:normal;color:#777;margin-left:6px;}
 table{width:100%;border-collapse:collapse;font-size:12px;}
 thead th{background:#f1f5f9;color:#555;padding:8px 10px;text-align:left;font-weight:600;border-bottom:1px solid #d5dbe3;}
 td{padding:8px 10px;border-bottom:1px solid #e8ebef;}
+tr{page-break-inside:avoid;}
+thead{display:table-header-group;}
 .r{text-align:right;} .c{text-align:center;}
 th.r{text-align:right;}
 tfoot td, tr.total td{font-weight:bold;background:#f8fafc;border-top:2px solid #1a56db;border-bottom:none;}

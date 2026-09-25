@@ -145,13 +145,14 @@ function createXeroClient({
   // Fails with a clear reason when the calls still owed to queued statements (the pending
   // counter, added when a batch is queued and taken back as each job finishes) exceed what
   // Xero says is left of today's quota. Unknown quota (nothing reported yet) passes.
-  async function assertBudget(ctx) {
+  // extraCalls: a batch about to be queued, checked together with what is already queued.
+  async function assertBudget(ctx, extraCalls = 0) {
     const remaining = await limiter.getDayRemaining(ctx.tenantId);
     if (remaining === null) return;
-    const pending = await limiter.getPending(ctx.tenantId);
-    if (remaining - dayReserve < pending) {
+    const needed = (await limiter.getPending(ctx.tenantId)) + extraCalls;
+    if (remaining - dayReserve < needed) {
       throw new XeroError(
-        `Xero daily call limit: ${pending} calls are still needed for queued statements but only ${remaining} are left today`,
+        `Xero daily call limit: ${needed} calls are still needed for queued statements but only ${remaining} are left today`,
         { code: 'XERO_DAILY_LIMIT' }
       );
     }

@@ -13,10 +13,10 @@
 //   - ctx is { clientId, tenantId, accessToken }; a cache implementation would use clientId.
 //
 // Shapes
-//   Invoice: { id, number, type, status, contactId, currency, date, dueDate, total,
+//   Invoice: { id, number, type, status, contactId, contactName, currency, date, dueDate, total,
 //              amountPaid, amountCredited, amountDue, updatedAt,
 //              payments: [{ id, date, amount, reference }] }
-//   Credit:  { kind: 'creditNote' | 'overpayment' | 'prepayment', id, number, status,
+//   Credit:  { kind: 'creditNote' | 'overpayment' | 'prepayment', id, contactId, number, status,
 //              currency, date, total, remaining,
 //              allocations: [{ date, amount, invoiceId, invoiceNumber }] }
 //   Contact: { id, name, email, archived }
@@ -55,6 +55,7 @@ function normalizeInvoice(x) {
     type: x.Type,
     status: x.Status,
     contactId: x.Contact?.ContactID || null,
+    contactName: x.Contact?.Name || '',
     currency: x.CurrencyCode,
     date: xeroLocalDate(x.DateString || x.Date),
     dueDate: xeroLocalDate(x.DueDateString || x.DueDate),
@@ -124,6 +125,7 @@ function normalizeCredit(kind, x) {
   return {
     kind,
     id: x[spec.idField],
+    contactId: x.Contact?.ContactID || null,
     number: spec.label(x),
     status: x.Status,
     currency: x.CurrencyCode,
@@ -198,6 +200,27 @@ function createXeroData(client) {
       return raw.map(normalizeInvoice).filter((i) => i.type === 'ACCREC');
     },
 
+    // Several contacts at once (the customer list needs each contact's email), in chunks so the
+    // URL stays short. A contact Xero does not return is simply absent from the result.
+    async getContactsByIds(ctx, contactIds, chunkSize = 30) {
+      const found = [];
+      for (let i = 0; i < contactIds.length; i += chunkSize) {
+        const chunk = contactIds.slice(i, i + chunkSize).map(assertGuid);
+        const data = await client.request(ctx, 'Contacts', { query: { IDs: chunk.join(',') } });
+        for (const c of data.Contacts || []) {
+          found.push({ id: c.ContactID, name: c.Name || '', email: (c.EmailAddress || '').trim(), archived: c.ContactStatus === 'ARCHIVED' });
+        }
+      }
+      return found;
+    },
+
+    // Daily-quota bookkeeping shared with the Xero client's limiter (see xeroClient.assertBudget).
+    assertBudget: (ctx, extraCalls = 0) => client.assertBudget(ctx, extraCalls),
+    dayRemaining: (tenantId) => client.limiter.getDayRemaining(tenantId),
+    addPending: (tenantId, calls) => client.limiter.addPending(tenantId, calls),
+    takePending: (tenantId, calls) => client.limiter.takePending(tenantId, calls),
+    getPending: (tenantId) => client.limiter.getPending(tenantId),
+
     // Organisation-wide, for the customer list and the recipient selector.
     async listOpenInvoices(ctx) {
       const raw = await client.getAllPages(ctx, 'Invoices', {
@@ -228,7 +251,12 @@ function getXeroData() {
       username: process.env.REDIS_USERNAME,
       password: process.env.REDIS_PASSWORD,
     });
-    defaultData = createXeroData(createXeroClient({ limiter: createRedisLimiter(redis) }));
+    // XERO_FIXTURES=1 (local dev stack only) swaps Xero for fixture data underneath the same
+    // client, limiter and data layer, so the real code paths run without a Xero connection.
+    const fixtures = process.env.XERO_FIXTURES === '1';
+    if (fixtures) console.warn('[xero] XERO_FIXTURES=1: answering from fixture data, not from Xero');
+    const fetchImpl = fixtures ? require('./xeroFixtures').createFixtureFetch() : undefined;
+    defaultData = createXeroData(createXeroClient({ limiter: createRedisLimiter(redis), ...(fetchImpl ? { fetchImpl } : {}) }));
   }
   return defaultData;
 }
