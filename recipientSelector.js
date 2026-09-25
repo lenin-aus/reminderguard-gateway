@@ -1,25 +1,7 @@
-const tokenManager = require('./tokenManager');
-const fetch = require('node-fetch');
+const { getXeroContext } = require('./xeroContext');
+const { getXeroData } = require('./xeroData');
 const { getOrFetchBaseCurrency, getTenantTodayDateString } = require('./shared');
-
-function parseXeroDate(dateVal) {
-  if (!dateVal) return null;
-  if (typeof dateVal === 'string' && dateVal.startsWith('/Date(')) {
-    const ms = parseInt(dateVal.replace('/Date(', '').replace(/[^0-9]/g, ''));
-    return new Date(ms);
-  }
-  const d = new Date(dateVal);
-  return isNaN(d.getTime()) ? null : d;
-}
-
-async function xeroGet(url, accessToken, tenantId) {
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${accessToken}`, 'Xero-tenant-id': tenantId, Accept: 'application/json' }
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(`Xero request failed: ${JSON.stringify(data)}`);
-  return data;
-}
+const { daysBetween } = require('./statementModel');
 
 // Returns an array of bucket objects — { bucketKey, contactId, currencyCode,
 // hasEmail, totalOutstanding } — for a client matching the given
@@ -27,37 +9,30 @@ async function xeroGet(url, accessToken, tenantId) {
 // before scheduled selection. This is an optimization only; the actual
 // duplicate-prevention mechanism is the worker's atomic SET NX lock.
 // recipientFilter: 'active' | 'outstanding' | 'outstanding_or_credits' | 'overdue'
-async function getFilteredContacts(clientId, recipientFilter) {
-  const { accessToken, tenantId } = await tokenManager.getValidToken(clientId);
+//
+// Xero is read through the shared data layer (paged, rate-limited). totalOutstanding is net of
+// credit notes, overpayments and prepayments, matching the statement itself, so a customer whose
+// credits cover what they owe is not selected. Amounts here are dollars.
+async function getFilteredContacts(clientId, recipientFilter, timeZone = 'Australia/Melbourne') {
+  const data = getXeroData();
+  const ctx = await getXeroContext(clientId);
   const baseCurrency = await getOrFetchBaseCurrency(clientId);
 
-  const invoicesData = await xeroGet(
-    'https://api.xero.com/api.xro/2.0/Invoices?Statuses=AUTHORISED&summaryOnly=false',
-    accessToken, tenantId
-  );
+  const [invoices, credits] = await Promise.all([data.listOpenInvoices(ctx), data.listOpenCredits(ctx)]);
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const ninetyDaysAgo = new Date(today);
-  ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+  const today = getTenantTodayDateString(timeZone);
+  const ninetyDaysAgo = daysBefore(today, 90);
 
   const buckets = {};
-  for (const inv of invoicesData.Invoices || []) {
-    if (inv.Type !== 'ACCREC') continue;
-    const contact = inv.Contact || {};
-    const contactId = contact.ContactID;
-    if (!contactId) continue;
-
-    const amountDue = parseFloat(inv.AmountDue) || 0;
-    const amountCredited = parseFloat(inv.AmountCredited) || 0;
-
-    const invoiceCurrency = (inv.CurrencyCode || baseCurrency || 'AUD').toUpperCase();
-    const bucketKey = `${contactId}_${invoiceCurrency}`;
+  for (const inv of invoices) {
+    if (!inv.contactId) continue;
+    const invoiceCurrency = (inv.currency || baseCurrency || 'AUD').toUpperCase();
+    const bucketKey = `${inv.contactId}_${invoiceCurrency}`;
 
     if (!buckets[bucketKey]) {
       buckets[bucketKey] = {
         bucketKey,
-        contactId,
+        contactId: inv.contactId,
         currencyCode: invoiceCurrency,
         hasEmail: false,
         totalOutstanding: 0,
@@ -68,16 +43,19 @@ async function getFilteredContacts(clientId, recipientFilter) {
     }
     const bucket = buckets[bucketKey];
 
-    const invoiceDate = parseXeroDate(inv.DateString || inv.Date);
-    const dueDate = parseXeroDate(inv.DueDateString || inv.DueDate);
-    const isOverdue = dueDate ? dueDate.getTime() < today.getTime() : false;
+    const isOverdue = inv.dueDate ? inv.dueDate < today : false;
 
-    bucket.totalOutstanding += amountDue;
-    bucket.totalCredited += amountCredited;
-    if (isOverdue) bucket.totalOverdue += amountDue;
-    if (invoiceDate && (!bucket.latestInvoiceDate || invoiceDate > bucket.latestInvoiceDate)) {
-      bucket.latestInvoiceDate = invoiceDate;
+    bucket.totalOutstanding += inv.amountDue / 100;
+    bucket.totalCredited += inv.amountCredited / 100;
+    if (isOverdue) bucket.totalOverdue += inv.amountDue / 100;
+    if (inv.date && (!bucket.latestInvoiceDate || inv.date > bucket.latestInvoiceDate)) {
+      bucket.latestInvoiceDate = inv.date;
     }
+  }
+
+  for (const credit of credits) {
+    const bucket = buckets[`${credit.contactId}_${String(credit.currency || baseCurrency || 'AUD').toUpperCase()}`];
+    if (bucket) bucket.totalOutstanding -= credit.remaining / 100;
   }
 
   const matched = Object.values(buckets).filter((b) => {
@@ -95,26 +73,16 @@ async function getFilteredContacts(clientId, recipientFilter) {
     }
   });
 
-  // Dedupe contactIds before batching /Contacts?IDs=... — a customer can
-  // appear as multiple bucketKeys (one per currency) but should only be
-  // looked up once.
+  // Dedupe contactIds before the lookup — a customer can appear as multiple
+  // bucketKeys (one per currency) but should only be looked up once.
   const uniqueContactIds = [...new Set(matched.map((b) => b.contactId))];
   const emailByContactId = {};
-
-  const CHUNK_SIZE = 30;
-  for (let i = 0; i < uniqueContactIds.length; i += CHUNK_SIZE) {
-    const chunk = uniqueContactIds.slice(i, i + CHUNK_SIZE);
-    try {
-      const contactsData = await xeroGet(
-        `https://api.xero.com/api.xro/2.0/Contacts?IDs=${chunk.join(',')}`,
-        accessToken, tenantId
-      );
-      for (const c of contactsData.Contacts || []) {
-        emailByContactId[c.ContactID] = (c.EmailAddress || '').trim().length > 0;
-      }
-    } catch (e) {
-      // Leave this chunk's contacts as hasEmail: false (default) on failure.
+  try {
+    for (const c of await data.getContactsByIds(ctx, uniqueContactIds)) {
+      emailByContactId[c.id] = c.email.length > 0;
     }
+  } catch (e) {
+    // Leave contacts as hasEmail: false (default) on failure.
   }
 
   for (const bucket of matched) {
@@ -125,6 +93,12 @@ async function getFilteredContacts(clientId, recipientFilter) {
   // balance are worth scheduling. Optimization only — the worker's own
   // terminal-skip checks and atomic lock remain the real safety net.
   return matched.filter((b) => b.hasEmail && b.totalOutstanding > 0);
+}
+
+function daysBefore(isoDate, days) {
+  const d = new Date(`${isoDate}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - days);
+  return d.toISOString().slice(0, 10);
 }
 
 module.exports = { getFilteredContacts };

@@ -7,6 +7,9 @@ const Redis = require('ioredis');
 const pool = require('./db');
 const { computeFirstRun, computeNextRun } = require('./scheduleCalc');
 const { getFilteredContacts } = require('./recipientSelector');
+const { getXeroData } = require('./xeroData');
+const { getXeroTenantId, CALLS_PER_STATEMENT } = require('./xeroContext');
+const { statementLockKey } = require('./statementOptions');
 const { getOrFetchBaseCurrency, getTenantTodayDateString } = require('./shared');
 
 const connection = {
@@ -117,7 +120,7 @@ async function runClient(config) {
       return;
     }
 
-    const buckets = await getFilteredContacts(clientId, fresh.recipient_filter || 'outstanding');
+    const buckets = await getFilteredContacts(clientId, fresh.recipient_filter || 'outstanding', fresh.schedule_timezone || 'Australia/Melbourne');
 
     if (buckets.length === 0) {
       await finishRun(runId, 'skipped_no_recipients', 0, null);
@@ -126,11 +129,11 @@ async function runClient(config) {
     }
 
     const baseCurrency = await getOrFetchBaseCurrency(clientId);
-    const todayDateString = getTenantTodayDateString();
+    const todayDateString = getTenantTodayDateString(fresh.schedule_timezone || 'Australia/Melbourne');
 
     // Pre-check the per-bucket idempotency keys (optimization only — the
     // worker's atomic SET NX lock is the real duplicate guard).
-    const sentKeys = buckets.map((b) => `sent-statement:${clientId}:${b.bucketKey}:${todayDateString}`);
+    const sentKeys = buckets.map((b) => statementLockKey(clientId, b.bucketKey, todayDateString));
     const sentFlags = await redis.mget(sentKeys);
     const toEnqueue = buckets.filter((_, i) => !sentFlags[i]);
 
@@ -167,7 +170,11 @@ async function runClient(config) {
         contactId: b.contactId,
         baseCurrency,
         todayDateString,
-        logId: logIdByBucketKey[b.bucketKey]
+        logId: logIdByBucketKey[b.bucketKey],
+        // A scheduled send has no options: sections 2 and 3 only, all open items as of today.
+        options: null,
+        optionsHash: 'default',
+        estimatedCalls: CALLS_PER_STATEMENT
       },
       opts: {
         jobId: `send-sched-${clientId}-${b.bucketKey}-${scheduledForIso}`,
@@ -178,7 +185,17 @@ async function runClient(config) {
       }
     }));
 
-    await autoStatementsQueue.addBulk(jobs);
+    // Reserve the calls these jobs will make against the daily Xero quota before they can start.
+    const xeroData = getXeroData();
+    const tenantId = await getXeroTenantId(clientId);
+    const reserved = toEnqueue.length * CALLS_PER_STATEMENT;
+    if (tenantId) await xeroData.addPending(tenantId, reserved);
+    try {
+      await autoStatementsQueue.addBulk(jobs);
+    } catch (queueErr) {
+      if (tenantId) await xeroData.takePending(tenantId, reserved).catch(() => {});
+      throw queueErr;
+    }
     await finishRun(runId, 'completed', toEnqueue.length, null);
     console.log(`[Heartbeat] Client ${clientId} — queued ${toEnqueue.length} bucket(s)`);
   } catch (e) {

@@ -14,6 +14,11 @@ const { createSession, resolveSession, startSessionCleanupJob } = require('./ses
 const { registerHeartbeat } = require('./scheduler');
 const { getOrFetchBaseCurrency, getTenantTodayDateString } = require('./shared');
 const { validateScheduleConfig, toApiConfig, READ_KEYS } = require('./scheduleConfig');
+const { getXeroContext, getXeroTenantId, CALLS_PER_STATEMENT } = require('./xeroContext');
+const { getXeroData } = require('./xeroData');
+const { validateStatementOptions, statementOptionsHash, statementLockKey, StatementOptionsError } = require('./statementOptions');
+const { todayInTimezone } = require('./statementRange');
+const { buildCustomerBuckets } = require('./customerBuckets');
 
 const app = express();
 app.use(express.json());
@@ -228,8 +233,8 @@ app.get('/oauth/callback', async (req, res) => {
       } else {
         try {
           const c = await pool.query(
-            "INSERT INTO client_config (client_name, xero_tenant_id, super_payment_mode) VALUES ($1, $2, 'payday') RETURNING id",
-            [tenantName, tenantId]
+            "INSERT INTO client_config (client_name, xero_tenant_id, super_payment_mode, sender_email, sender_name) VALUES ($1, $2, 'payday', $3, $4) RETURNING id",
+            [tenantName, tenantId, process.env.DEFAULT_SENDER_EMAIL || null, process.env.DEFAULT_SENDER_NAME || null]
           );
           clientId = c.rows[0].id;
           const connectionId = await tokenManager.createConnection(tokenResponse, 'self_serve', tenantName);
@@ -312,8 +317,8 @@ app.post('/oauth/select-org', async (req, res) => {
     } else {
       try {
         const c = await pool.query(
-          "INSERT INTO client_config (client_name, xero_tenant_id, super_payment_mode) VALUES ($1, $2, 'payday') RETURNING id",
-          [tenantName, tenantId]
+          "INSERT INTO client_config (client_name, xero_tenant_id, super_payment_mode, sender_email, sender_name) VALUES ($1, $2, 'payday', $3, $4) RETURNING id",
+          [tenantName, tenantId, process.env.DEFAULT_SENDER_EMAIL || null, process.env.DEFAULT_SENDER_NAME || null]
         );
         clientId = c.rows[0].id;
         const connectionId = await tokenManager.createConnection(tokenResponse, 'self_serve', tenantName);
@@ -420,17 +425,47 @@ app.post('/trigger/auto-statements/:clientId', resolveSession, async (req, res) 
   }
 
   try {
+    // Per-send options from the send modal (date range, reply-to, BCC, subject, body). They apply to
+    // this send only and travel on the job; nothing is saved as a client default.
+    const { rows: tzRows } = await pool.query('SELECT schedule_timezone FROM client_config WHERE id = $1', [clientId]);
+    const timezone = tzRows[0]?.schedule_timezone || 'Australia/Melbourne';
+    let options;
+    try {
+      options = validateStatementOptions(req.body.options, { timezone });
+    } catch (e) {
+      if (e instanceof StatementOptionsError) {
+        return res.status(400).json({ error: e.message, code: e.code, fields: e.fields });
+      }
+      throw e;
+    }
+    const optionsHash = statementOptionsHash(options);
+
     const baseCurrency = await getOrFetchBaseCurrency(clientId);
-    const todayDateString = getTenantTodayDateString();
+    const todayDateString = getTenantTodayDateString(timezone);
 
     // Batch idempotency pre-check (optimization only — the worker's atomic
-    // SET NX lock is the actual duplicate-prevention mechanism).
-    const redisKeys = parsed.map((p) => `sent-statement:${clientId}:${p.bucketKey}:${todayDateString}`);
+    // SET NX lock is the actual duplicate-prevention mechanism). The key includes a hash of the
+    // options, so an identical resend is blocked but a corrected one goes out.
+    const redisKeys = parsed.map((p) => statementLockKey(clientId, p.bucketKey, todayDateString, optionsHash));
     const sentFlags = redisKeys.length > 0 ? await redis.mget(redisKeys) : [];
 
     const toEnqueue = parsed.filter((_, i) => !sentFlags[i]);
     if (toEnqueue.length === 0) {
       return res.status(202).json({ success: true, queuedCount: 0, message: 'All selected statements already sent today.' });
+    }
+
+    // Xero's daily call limit is per organisation. Refuse the whole batch up front, with a clear
+    // reason, if the statements already queued plus this batch need more calls than are left today.
+    const xeroData = getXeroData();
+    const tenantId = await getXeroTenantId(clientId);
+    const estimatedCalls = toEnqueue.length * CALLS_PER_STATEMENT;
+    if (tenantId) {
+      try {
+        await xeroData.assertBudget({ tenantId }, estimatedCalls);
+      } catch (e) {
+        if (e.code === 'XERO_DAILY_LIMIT') return res.status(429).json({ error: e.message, code: e.code });
+        throw e;
+      }
     }
 
     // Bulk-insert PROCESSING rows now, not left to the worker at execution
@@ -465,9 +500,12 @@ app.post('/trigger/auto-statements/:clientId', resolveSession, async (req, res) 
         baseCurrency,
         todayDateString,
         logId: logIdByBucketKey[p.bucketKey],
+        options,
+        optionsHash,
+        estimatedCalls: CALLS_PER_STATEMENT,
       },
       opts: {
-        jobId: `send-manual-${clientId}-${p.bucketKey}-${todayDateString}-${minuteWindow}`,
+        jobId: `send-manual-${clientId}-${p.bucketKey}-${todayDateString}-${optionsHash}-${minuteWindow}`,
        backoff: { type: 'custom' },
         attempts: 5,
         removeOnComplete: { age: 86400, count: 100 },
@@ -475,7 +513,15 @@ app.post('/trigger/auto-statements/:clientId', resolveSession, async (req, res) 
       },
     }));
 
-    await autoStatementsQueue.addBulk(jobs);
+    // Reserve the calls before queueing so a job that finishes at once cannot give back budget
+    // that was not added yet; undo the reservation if queueing fails.
+    if (tenantId) await xeroData.addPending(tenantId, estimatedCalls);
+    try {
+      await autoStatementsQueue.addBulk(jobs);
+    } catch (queueErr) {
+      if (tenantId) await xeroData.takePending(tenantId, estimatedCalls).catch(() => {});
+      throw queueErr;
+    }
 
     return res.status(202).json({
       success: true,
@@ -540,6 +586,28 @@ app.all('/proxy/xero/:clientId/*', resolveSession, async (req, res) => {
   }
 });
 
+// The Xero side of the customer list: open invoices, remaining credits, and which contacts have
+// an email. Cached in Redis so post-send polling never calls Xero; a fresh load refreshes it.
+const CUSTOMER_CACHE_TTL_S = 10 * 60;
+async function loadCustomerSource(clientId, { useCache }) {
+  const cacheKey = `xero:cache:customers:${clientId}`;
+  if (useCache) {
+    const hit = await redis.get(cacheKey);
+    if (hit) return JSON.parse(hit);
+  }
+  const data = getXeroData();
+  const ctx = await getXeroContext(clientId);
+  const [invoices, credits] = await Promise.all([data.listOpenInvoices(ctx), data.listOpenCredits(ctx)]);
+  const contactIds = [...new Set(invoices.map((i) => i.contactId).filter(Boolean))];
+  const emailByContactId = {};
+  for (const contact of await data.getContactsByIds(ctx, contactIds)) {
+    emailByContactId[contact.id] = contact.email.length > 0;
+  }
+  const source = { invoices, credits, emailByContactId };
+  await redis.set(cacheKey, JSON.stringify(source), 'EX', CUSTOMER_CACHE_TTL_S).catch(() => {});
+  return source;
+}
+
 // ── Self-serve Auto Statements customer list ──────────────────────────────
 app.get('/clients/:clientId/statements/customers', resolveSession, async (req, res) => {
   const { clientId } = req.params;
@@ -549,125 +617,24 @@ app.get('/clients/:clientId/statements/customers', resolveSession, async (req, r
   }
 
   try {
-    const { accessToken, tenantId } = await tokenManager.getValidToken(clientId);
     const baseCurrency = await getOrFetchBaseCurrency(clientId);
+    const { rows: tzRows } = await pool.query('SELECT schedule_timezone FROM client_config WHERE id = $1', [clientId]);
+    const timezone = tzRows[0]?.schedule_timezone || 'Australia/Melbourne';
 
-    const invoicesRes = await fetch(
-      'https://api.xero.com/api.xro/2.0/Invoices?Statuses=AUTHORISED&summaryOnly=false',
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Xero-tenant-id': tenantId,
-          Accept: 'application/json',
-        },
-      }
-    );
-    const invoicesData = await invoicesRes.json();
-    if (!invoicesRes.ok) {
-      return res.status(502).json({ error: 'Xero request failed', detail: invoicesData });
-    }
+    // A normal load reads Xero fresh. The post-send polling passes ?poll=1: it only wants each
+    // row's live lastSent (read from the database below), so it may reuse the Xero data from
+    // the last fresh load and costs no Xero calls.
+    const source = await loadCustomerSource(clientId, { useCache: req.query.poll === '1' });
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    function parseXeroDate(dateVal) {
-      if (!dateVal) return null;
-      if (typeof dateVal === 'string' && dateVal.startsWith('/Date(')) {
-        const ms = parseInt(dateVal.replace('/Date(', '').replace(/[^0-9]/g, ''));
-        return new Date(ms);
-      }
-      const d = new Date(dateVal);
-      return isNaN(d.getTime()) ? null : d;
-    }
-
-    function daysDiff(date) {
-      if (!date) return 0;
-      return Math.floor((today - date) / (1000 * 60 * 60 * 24));
-    }
-
-    // NFD-normalize + strip diacritics + replace invalid filename chars, so a
-    // customer with no ASCII-safe name still gets a stable, unique bucketKey.
-    function sanitizeForKey(str) {
-      return (str || '')
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .replace(/[^a-zA-Z0-9_-]/g, '_')
-        .replace(/^_+|_+$/g, '');
-    }
-
-    const allInvoices = invoicesData.Invoices || [];
     const buckets = {};
-
-    for (const inv of allInvoices) {
-      if (inv.Type !== 'ACCREC') continue;
-
-      const contact = inv.Contact || {};
-      const contactId = contact.ContactID;
-      if (!contactId) continue;
-
-      const amountDue = parseFloat(inv.AmountDue) || 0;
-      if (amountDue <= 0) continue;
-
-      const invoiceCurrency = (inv.CurrencyCode || baseCurrency || 'AUD').toUpperCase();
-      const bucketKey = `${contactId}_${invoiceCurrency}` || `fallback_${contactId || Math.random().toString(36).slice(2)}`;
-
-      if (!buckets[bucketKey]) {
-        buckets[bucketKey] = {
-          bucketKey,
-          contactId,
-          contactName: contact.Name || contactId,
-          currencyCode: invoiceCurrency,
-          hasEmail: false,
-          theyOwe: 0,
-          overdueAmount: 0,
-          daysOverdue: 0,
-        };
-      }
-
-      const bucket = buckets[bucketKey];
-      const dueDate = parseXeroDate(inv.DueDateString || inv.DueDate);
-      const daysOverdueForInvoice = dueDate ? Math.max(0, daysDiff(dueDate)) : 0;
-
-      bucket.theyOwe += amountDue;
-      if (daysOverdueForInvoice > 0) {
-        bucket.overdueAmount += amountDue;
-      }
-      if (daysOverdueForInvoice > bucket.daysOverdue) {
-        bucket.daysOverdue = daysOverdueForInvoice;
-      }
-    }
-
-    // Dedupe contactIds before batching /Contacts?IDs=... — a customer can
-    // appear as multiple bucketKeys (one per currency) but should only be
-    // looked up once.
-    const uniqueContactIds = [...new Set(Object.values(buckets).map((b) => b.contactId))];
-    const emailByContactId = {};
-
-    const CHUNK_SIZE = 30;
-    for (let i = 0; i < uniqueContactIds.length; i += CHUNK_SIZE) {
-      const chunk = uniqueContactIds.slice(i, i + CHUNK_SIZE);
-      try {
-        const contactsRes = await fetch(
-          `https://api.xero.com/api.xro/2.0/Contacts?IDs=${chunk.join(',')}`,
-          {
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              'Xero-tenant-id': tenantId,
-              Accept: 'application/json',
-            },
-          }
-        );
-        const contactsData = await contactsRes.json();
-        for (const c of contactsData.Contacts || []) {
-          emailByContactId[c.ContactID] = (c.EmailAddress || '').trim().length > 0;
-        }
-      } catch (e) {
-        // Leave this chunk's contacts as hasEmail: false (default) on failure.
-      }
-    }
-
-    for (const bucket of Object.values(buckets)) {
-      bucket.hasEmail = emailByContactId[bucket.contactId] || false;
+    for (const customer of buildCustomerBuckets({
+      invoices: source.invoices,
+      credits: source.credits,
+      emailByContactId: source.emailByContactId,
+      today: todayInTimezone(timezone),
+      baseCurrency,
+    })) {
+      buckets[customer.bucketKey] = customer;
     }
 
     // Compute "Last sent" per bucketKey from the latest statement_logs row.
@@ -714,14 +681,13 @@ app.get('/clients/:clientId/statements/customers', resolveSession, async (req, r
 
     const customers = Object.values(buckets).map((b) => ({
       ...b,
-      theyOwe: parseFloat(b.theyOwe.toFixed(2)),
-      overdueAmount: parseFloat(b.overdueAmount.toFixed(2)),
       lastSent: lastSentByBucketKey[b.bucketKey] || 'Never',
     }));
 
     res.json({ customers });
   } catch (e) {
     console.error('Statements customers error:', e);
+    if (e.code === 'XERO_DAILY_LIMIT') return res.status(429).json({ error: e.message, code: e.code });
     if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
     if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
     res.status(502).json({ error: e.message, code: e.code || 'GATEWAY_ERROR' });
@@ -760,6 +726,17 @@ app.get('/clients/:clientId/statement-logs', resolveSession, async (req, res) =>
 // comes from the session (req.client_id), never from the request body.
 const CONFIG_COLUMNS = READ_KEYS.join(', ');
 
+// Read-only extras the send modal shows: who statements are sent as, and the company name used
+// by {{your_company_name}}. They are not part of the writable config (a PUT containing them is a 400).
+function withSender(apiConfig, row) {
+  return {
+    ...apiConfig,
+    client_name: row.client_name ?? null,
+    sender_name: row.sender_name ?? null,
+    sender_email: row.sender_email ?? null,
+  };
+}
+
 app.get('/clients/:clientId/config', resolveSession, async (req, res) => {
   if (String(req.client_id) !== String(req.params.clientId)) {
     return res.status(403).json({ error: 'Forbidden' });
@@ -767,11 +744,11 @@ app.get('/clients/:clientId/config', resolveSession, async (req, res) => {
 
   try {
     const { rows } = await pool.query(
-      `SELECT ${CONFIG_COLUMNS}, next_run_at FROM client_config WHERE id = $1`,
+      `SELECT ${CONFIG_COLUMNS}, next_run_at, client_name, sender_email, sender_name FROM client_config WHERE id = $1`,
       [req.client_id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Client not found' });
-    res.json(toApiConfig(rows[0]));
+    res.json(withSender(toApiConfig(rows[0]), rows[0]));
   } catch (e) {
     console.error('Get client config error:', e);
     res.status(500).json({ error: 'Server error' });
@@ -819,7 +796,7 @@ app.put('/clients/:clientId/config', resolveSession, async (req, res) => {
            ELSE next_run_at
          END
        WHERE id = $12
-       RETURNING ${CONFIG_COLUMNS}, next_run_at`,
+       RETURNING ${CONFIG_COLUMNS}, next_run_at, client_name, sender_email, sender_name`,
       [
         c.auto_statements_enabled,
         c.schedule_unit,
@@ -836,7 +813,7 @@ app.put('/clients/:clientId/config', resolveSession, async (req, res) => {
       ]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Client not found' });
-    res.json(toApiConfig(rows[0]));
+    res.json(withSender(toApiConfig(rows[0]), rows[0]));
   } catch (e) {
     console.error('Update client config error:', e);
     res.status(500).json({ error: 'Server error' });
