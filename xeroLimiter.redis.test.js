@@ -34,8 +34,14 @@ test('redis limiter: shared window and concurrency across two limiter instances'
 
     await a.setDayRemaining(tenant, 500);
     assert.equal(await b.getDayRemaining(tenant), 500);
+
+    await a.addPending(tenant, 100);
+    await b.addPending(tenant, 20);
+    assert.equal(await a.getPending(tenant), 120);
+    await b.takePending(tenant, 500);
+    assert.equal(await a.getPending(tenant), 0, 'the counter never goes negative');
   } finally {
-    await redis.del(`xero:rl:${tenant}`, `xero:conc:${tenant}`, `xero:day:${tenant}`);
+    await redis.del(`xero:rl:${tenant}`, `xero:conc:${tenant}`, `xero:day:${tenant}`, `xero:pending:${tenant}`);
     redis.disconnect();
   }
 });

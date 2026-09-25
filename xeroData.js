@@ -18,7 +18,7 @@
 //              payments: [{ id, date, amount, reference }] }
 //   Credit:  { kind: 'creditNote' | 'overpayment' | 'prepayment', id, number, status,
 //              currency, date, total, remaining,
-//              allocations: [{ date, amount, invoiceNumber }] }
+//              allocations: [{ date, amount, invoiceId, invoiceNumber }] }
 //   Contact: { id, name, email, archived }
 
 const { createXeroClient } = require('./xeroClient');
@@ -78,6 +78,9 @@ function normalizeAllocations(x) {
   return (x.Allocations || []).map((a) => ({
     date: xeroLocalDate(a.DateString || a.Date),
     amount: cents(a.Amount),
+    // Xero returns only a stub of the invoice here (its number is often empty), so callers
+    // that need the number look it up by id among the contact's invoices.
+    invoiceId: a.Invoice?.InvoiceID || null,
     invoiceNumber: a.Invoice?.InvoiceNumber || '',
   }));
 }
@@ -113,6 +116,9 @@ const CREDIT_KINDS = {
 // are gone (Xero's own statements leave them out too).
 const POSTED_CREDIT_STATUSES = new Set(['AUTHORISED', 'PAID']);
 
+// A contact whose history needs more pages than this is logged as a warning.
+const HISTORY_WARN_PAGES = 5;
+
 function normalizeCredit(kind, x) {
   const spec = CREDIT_KINDS[kind];
   return {
@@ -133,11 +139,6 @@ const GUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a
 function assertGuid(id) {
   if (!GUID.test(String(id))) throw new Error(`Not a valid Xero contact id: ${id}`);
   return id;
-}
-
-// Xero timestamps for If-Modified-Since are UTC, without an offset.
-function toModifiedSince(utcIso) {
-  return utcIso.slice(0, 19);
 }
 
 function createXeroData(client) {
@@ -181,15 +182,18 @@ function createXeroData(client) {
       return lists.flat();
     },
 
-    // Receivable invoices (AUTHORISED or PAID) that changed on or after modifiedSinceUtc,
-    // each with its Payments. Xero filters on UpdatedDateUTC, which is when a record was
-    // last edited, not when a payment is dated: the caller must still filter every payment
-    // by its own date and discard invoices that were merely edited.
-    async getInvoiceActivity(ctx, contactId, { modifiedSinceUtc }) {
+    // A contact's complete receivable history (AUTHORISED and PAID), with each invoice's Payments.
+    // Deliberately not narrowed with If-Modified-Since: that header filters on when a record was
+    // last edited, not on payment dates, so a payment missed by it would silently corrupt the
+    // opening balance and every running balance below it. Measured on a real organisation the
+    // full history is small (4 invoices, 1 page, 18 KB for its largest contact); a contact
+    // needing more than HISTORY_WARN_PAGES pages is logged so large clients show up early.
+    async getInvoiceHistory(ctx, contactId) {
       const raw = await client.getAllPages(ctx, 'Invoices', {
         query: { ContactIDs: assertGuid(contactId), Statuses: 'AUTHORISED,PAID' },
         listKey: 'Invoices',
-        headers: { 'If-Modified-Since': toModifiedSince(modifiedSinceUtc) },
+        warnPages: HISTORY_WARN_PAGES,
+        label: `invoice history of contact ${contactId}`,
       });
       return raw.map(normalizeInvoice).filter((i) => i.type === 'ACCREC');
     },
@@ -229,4 +233,4 @@ function getXeroData() {
   return defaultData;
 }
 
-module.exports = { createXeroData, getXeroData, xeroLocalDate, normalizeInvoice, normalizeCredit, cents };
+module.exports = { createXeroData, getXeroData, xeroLocalDate, normalizeInvoice, normalizeCredit, cents, HISTORY_WARN_PAGES };

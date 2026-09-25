@@ -177,3 +177,31 @@ test('getAllPages refuses to page forever', async () => {
   const { client } = setup([full(), full(), full()]);
   await assert.rejects(client.getAllPages(ctx, 'Invoices', { listKey: 'Invoices', maxPages: 3 }), (err) => err.code === 'XERO_TOO_MANY_PAGES');
 });
+
+test('getAllPages warns when a list needs more pages than warnPages, and not otherwise', async () => {
+  const warnings = [];
+  const page = (count) => response(200, { Invoices: Array.from({ length: count }, () => ({})) });
+  const many = setup([page(100), page(100), page(100), page(5)], { client: { log: { warn: (m) => warnings.push(m) } } });
+  await many.client.getAllPages(ctx, 'Invoices', { listKey: 'Invoices', warnPages: 3, label: 'history of contact X' });
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /large list: history of contact X for tenant T1 needed 4 pages \(305 records\)/);
+
+  const few = setup([page(100), page(5)], { client: { log: { warn: (m) => warnings.push(m) } } });
+  await few.client.getAllPages(ctx, 'Invoices', { listKey: 'Invoices', warnPages: 3 });
+  assert.equal(warnings.length, 1, 'two pages is under the threshold');
+});
+
+test('assertBudget fails with a clear reason when queued statements need more calls than are left today', async () => {
+  const { client, limiter } = setup([]);
+  await client.assertBudget(ctx); // quota unknown: passes
+
+  await limiter.setDayRemaining('T1', 300);
+  await limiter.addPending('T1', 250);
+  await client.assertBudget(ctx); // 300 - 25 reserve = 275 >= 250
+
+  await limiter.addPending('T1', 30);
+  await assert.rejects(client.assertBudget(ctx), (err) => err.code === 'XERO_DAILY_LIMIT' && /280 calls are still needed .* only 300 are left/.test(err.message));
+
+  await limiter.takePending('T1', 100); // some queued statements finished
+  await client.assertBudget(ctx);
+});

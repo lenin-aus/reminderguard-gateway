@@ -21,6 +21,7 @@ const DEFAULTS = {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const PENDING_TTL_MS = 6 * 60 * 60 * 1000;
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function createMemoryLimiter(options = {}) {
@@ -64,6 +65,16 @@ function createMemoryLimiter(options = {}) {
     },
     async getDayRemaining(tenantId) {
       return state(tenantId).day;
+    },
+    // Calls that queued work is still expected to make against this tenant's daily quota.
+    async addPending(tenantId, calls) {
+      state(tenantId).pending = (state(tenantId).pending || 0) + calls;
+    },
+    async takePending(tenantId, calls) {
+      state(tenantId).pending = Math.max(0, (state(tenantId).pending || 0) - calls);
+    },
+    async getPending(tenantId) {
+      return state(tenantId).pending || 0;
     },
   };
 }
@@ -129,6 +140,20 @@ function createRedisLimiter(redis, options = {}) {
     async getDayRemaining(tenantId) {
       const value = await redis.get(`xero:day:${tenantId}`);
       return value === null ? null : Number(value);
+    },
+    // The pending counter expires on its own so jobs that died cannot hold budget forever.
+    async addPending(tenantId, calls) {
+      const key = `xero:pending:${tenantId}`;
+      await redis.incrby(key, calls);
+      await redis.pexpire(key, PENDING_TTL_MS);
+    },
+    async takePending(tenantId, calls) {
+      const key = `xero:pending:${tenantId}`;
+      const left = await redis.decrby(key, calls);
+      if (left < 0) await redis.set(key, '0', 'PX', PENDING_TTL_MS);
+    },
+    async getPending(tenantId) {
+      return Number(await redis.get(`xero:pending:${tenantId}`)) || 0;
     },
   };
 }

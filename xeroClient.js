@@ -121,7 +121,9 @@ function createXeroClient({
 
   // Fetches every page of a list endpoint. listKey is the property that holds the items
   // ('Invoices', 'CreditNotes', ...). A page shorter than pageSize is the last one.
-  async function getAllPages(ctx, path, { query = {}, listKey, pageSize = 100, maxPages = 200, headers } = {}) {
+  // warnPages: log a warning when a list needs more pages than this, so a large organisation
+  // shows up in the logs before it exhausts the daily call limit.
+  async function getAllPages(ctx, path, { query = {}, listKey, pageSize = 100, maxPages = 200, headers, warnPages = null, label = path } = {}) {
     const items = [];
     for (let page = 1; page <= maxPages; page++) {
       const data = await request(ctx, path, {
@@ -130,12 +132,32 @@ function createXeroClient({
       });
       const batch = data[listKey] || [];
       items.push(...batch);
-      if (batch.length < pageSize) return items;
+      if (batch.length < pageSize) {
+        if (warnPages !== null && page > warnPages) {
+          log.warn?.(`[xero] large list: ${label} for tenant ${ctx.tenantId} needed ${page} pages (${items.length} records); each statement of this size costs ${page} calls`);
+        }
+        return items;
+      }
     }
     throw new XeroError(`Xero list ${path} exceeded ${maxPages} pages`, { code: 'XERO_TOO_MANY_PAGES' });
   }
 
-  return { request, getAllPages };
+  // Fails with a clear reason when the calls still owed to queued statements (the pending
+  // counter, added when a batch is queued and taken back as each job finishes) exceed what
+  // Xero says is left of today's quota. Unknown quota (nothing reported yet) passes.
+  async function assertBudget(ctx) {
+    const remaining = await limiter.getDayRemaining(ctx.tenantId);
+    if (remaining === null) return;
+    const pending = await limiter.getPending(ctx.tenantId);
+    if (remaining - dayReserve < pending) {
+      throw new XeroError(
+        `Xero daily call limit: ${pending} calls are still needed for queued statements but only ${remaining} are left today`,
+        { code: 'XERO_DAILY_LIMIT' }
+      );
+    }
+  }
+
+  return { request, getAllPages, assertBudget, limiter };
 }
 
 module.exports = { createXeroClient, XeroError, buildUrl, XERO_API };

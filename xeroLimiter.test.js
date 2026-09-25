@@ -78,3 +78,16 @@ test('the daily quota reported by Xero is stored per tenant', async () => {
   assert.equal(await limiter.getDayRemaining('T1'), 986);
   assert.equal(await limiter.getDayRemaining('T2'), null);
 });
+
+test('pending calls accumulate, are taken back, and never go negative', async () => {
+  const limiter = createMemoryLimiter();
+  assert.equal(await limiter.getPending('T1'), 0);
+  await limiter.addPending('T1', 100);
+  await limiter.addPending('T1', 20);
+  assert.equal(await limiter.getPending('T1'), 120);
+  await limiter.takePending('T1', 50);
+  assert.equal(await limiter.getPending('T1'), 70);
+  await limiter.takePending('T1', 500);
+  assert.equal(await limiter.getPending('T1'), 0);
+  assert.equal(await limiter.getPending('T2'), 0);
+});

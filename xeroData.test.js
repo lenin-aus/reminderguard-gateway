@@ -59,8 +59,8 @@ test('normalizeInvoice maps fields, drops deleted payments and reads the update 
   const n = normalizeInvoice(
     invoice({
       Payments: [
-        { PaymentID: 'p1', DateString: '2026-07-13T00:00:00', Amount: 850, Reference: 'EFT' },
-        { PaymentID: 'p2', DateString: '2026-07-14T00:00:00', Amount: 5, Status: 'DELETED' },
+        { PaymentID: 'p1', Date: '/Date(1783900800000+0000)/', Amount: 850, Reference: 'EFT' },
+        { PaymentID: 'p2', Date: '/Date(1783987200000+0000)/', Amount: 5, Status: 'DELETED' },
       ],
     })
   );
@@ -91,7 +91,7 @@ test('getCredits merges credit notes, overpayments and prepayments, receivable s
       { CreditNoteID: 'cn4', CreditNoteNumber: 'ORC8', Type: 'ACCRECCREDIT', Status: 'DRAFT', CurrencyCode: 'AUD', DateString: '2026-08-02T00:00:00', Total: 10, RemainingCredit: 10 },
       {
         CreditNoteID: 'cn5', CreditNoteNumber: 'ORC7', Type: 'ACCRECCREDIT', Status: 'PAID', CurrencyCode: 'AUD', DateString: '2026-07-01T00:00:00', Total: 40, RemainingCredit: 0,
-        Allocations: [{ Amount: 40, DateString: '2026-07-02T00:00:00', Invoice: { InvoiceNumber: 'ORC1002' } }],
+        Allocations: [{ Amount: 40, Date: '/Date(1782950400000+0000)/', Invoice: { InvoiceID: 'inv-1', InvoiceNumber: '' } }],
       },
     ],
     Overpayments: [
@@ -107,19 +107,20 @@ test('getCredits merges credit notes, overpayments and prepayments, receivable s
   assert.deepEqual(credits.map((c) => c.id).sort(), ['cn1', 'cn5', 'op1', 'pp1']);
   const cn1 = credits.find((c) => c.id === 'cn1');
   assert.deepEqual([cn1.kind, cn1.number, cn1.date, cn1.total, cn1.remaining], ['creditNote', 'ORC1037', '2026-08-23', 6050, 6050]);
-  assert.deepEqual(credits.find((c) => c.id === 'cn5').allocations, [{ date: '2026-07-02', amount: 4000, invoiceNumber: 'ORC1002' }]);
+  assert.deepEqual(credits.find((c) => c.id === 'cn5').allocations, [{ date: '2026-07-02', amount: 4000, invoiceId: 'inv-1', invoiceNumber: '' }]);
   assert.equal(credits.find((c) => c.id === 'pp1').number, 'Deposit');
   assert.equal(credits.find((c) => c.id === 'op1').number, 'Overpayment');
   for (const call of client.calls) assert.equal(call.opts.query.where, `Contact.ContactID==Guid("${CONTACT}")`);
 });
 
-test('getInvoiceActivity sends If-Modified-Since as a UTC timestamp and keeps receivables only', async () => {
-  const client = fakeClient({ Invoices: [invoice(), invoice({ InvoiceID: 'b', Type: 'ACCPAY' })] });
-  const result = await createXeroData(client).getInvoiceActivity(CTX, CONTACT, { modifiedSinceUtc: '2026-05-26T14:00:00.000Z' });
+test('getInvoiceHistory fetches the whole AUTHORISED+PAID history with no If-Modified-Since, receivables only', async () => {
+  const client = fakeClient({ Invoices: [invoice(), invoice({ InvoiceID: 'b', Type: 'ACCPAY' }), invoice({ InvoiceID: 'p', Status: 'PAID', AmountDue: 0 })] });
+  const result = await createXeroData(client).getInvoiceHistory(CTX, CONTACT);
 
-  assert.deepEqual(result.map((i) => i.id), ['inv-1']);
+  assert.deepEqual(result.map((i) => i.id), ['inv-1', 'p'], 'paid invoices are kept, payables are not');
   assert.deepEqual(client.calls[0].opts.query, { ContactIDs: CONTACT, Statuses: 'AUTHORISED,PAID' });
-  assert.deepEqual(client.calls[0].opts.headers, { 'If-Modified-Since': '2026-05-26T14:00:00' });
+  assert.equal(client.calls[0].opts.headers, undefined, 'no If-Modified-Since: a payment it missed would corrupt every balance below it');
+  assert.equal(client.calls[0].opts.warnPages, 5);
 });
 
 test('contact ids are validated before they reach a Xero filter', async () => {
@@ -127,7 +128,7 @@ test('contact ids are validated before they reach a Xero filter', async () => {
   const bad = 'x") OR (Total>0';
   await assert.rejects(data.getCredits(CTX, bad), /valid Xero contact id/);
   await assert.rejects(data.getOpenInvoices(CTX, bad), /valid Xero contact id/);
-  await assert.rejects(data.getInvoiceActivity(CTX, bad, { modifiedSinceUtc: '2026-01-01T00:00:00Z' }), /valid Xero contact id/);
+  await assert.rejects(data.getInvoiceHistory(CTX, bad), /valid Xero contact id/);
   await assert.rejects(data.getContact(CTX, bad), /valid Xero contact id/);
 });
 
