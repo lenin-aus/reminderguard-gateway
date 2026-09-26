@@ -673,7 +673,8 @@ async function loadCustomerSource(clientId, { useCache }) {
       return null;
     });
   }
-  return { ...liveSource, source: 'live', syncedAt: xeroSource.syncedAt, shadow };
+  // syncedAt stays null: this answer is Xero's, so the page must not say it is the copy's age.
+  return { ...liveSource, source: 'live', syncedAt: null, shadow, shadowSyncedAt: xeroSource.syncedAt };
 }
 
 // ── Self-serve Auto Statements customer list ──────────────────────────────
@@ -694,7 +695,7 @@ app.get('/clients/:clientId/statements/customers', resolveSession, requireClient
     const today = todayInTimezone(timezone);
     const bucketsOf = (from) => buildCustomerBuckets({ invoices: from.invoices, credits: from.credits, emailByContactId: from.emailByContactId, today, baseCurrency });
     const list = bucketsOf(source);
-    if (source.shadow) console.log(formatShadowLog(clientId, diffCustomers(list, bucketsOf(source.shadow)), source.syncedAt));
+    if (source.shadow) console.log(formatShadowLog(clientId, diffCustomers(list, bucketsOf(source.shadow)), source.shadowSyncedAt));
 
     const buckets = {};
     for (const customer of list) buckets[customer.bucketKey] = customer;
