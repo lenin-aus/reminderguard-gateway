@@ -40,17 +40,20 @@ async function completeFastledgerSignIn(deps, { csrfNonce, tokenResponse }) {
     return fail(403, code, 'Your Xero sign-in could not be verified. Please try again.');
   }
 
+  // accounts.js names the field displayName; the verified token calls it name.
+  const login = { subject: identity.subject, email: identity.email, displayName: identity.name };
+
   let accountId;
   if (flow.intent === 'add') {
     accountId = flow.accountId;
     if (!(await accounts.getAccount(pool, accountId))) return fail(403, 'NO_ACCOUNT', 'Your session has ended. Please sign in again.');
-    const added = await accounts.addIdentityToAccount(pool, accountId, identity);
+    const added = await accounts.addIdentityToAccount(pool, accountId, login);
     if (added.result === 'conflict') {
       log.warn?.(`[org-connect] IDENTITY_CONFLICT account=${accountId} other_account=${added.otherAccountId} login=${identity.subject}`);
       return fail(409, 'IDENTITY_CONFLICT', 'That Xero login already belongs to another FastLedger account.');
     }
   } else {
-    ({ accountId } = await accounts.findOrCreateAccountForIdentity(pool, identity));
+    ({ accountId } = await accounts.findOrCreateAccountForIdentity(pool, login));
   }
 
   // 3. The orgs ticked in this consent.
@@ -125,13 +128,17 @@ async function completeFastledgerSignIn(deps, { csrfNonce, tokenResponse }) {
     return fail(owned ? 403 : 500, owned ? 'ORG_OWNED_BY_ANOTHER_ACCOUNT' : 'CONNECT_FAILED', owned ? REJECT_MESSAGE : 'We could not connect your organisation. Please try again.');
   }
 
-  // 4. Where they land: a newly connected org first, otherwise the org they used last.
-  let activeClientId = null;
-  if (connected.length > 0) {
-    activeClientId = connected[0].clientId;
+  // 4. Where they land. A sign-in opens the org used last, or the first by name when there is none
+  // (or it is no longer on the account). An org newly added to this account (create or claim)
+  // takes over, so "Connect another org" lands on it.
+  const clients = await accounts.listAccountClients(pool, accountId);
+  const account = await accounts.getAccount(pool, accountId);
+  let activeClientId = clients.find((c) => c.client_id === account?.last_client_id)?.client_id ?? null;
+  const added = connected.find((c) => c.action !== 'reconnect');
+  if (flow.intent === 'add' && added) activeClientId = added.clientId;
+  if (activeClientId === null) activeClientId = clients[0]?.client_id ?? null; // clients are sorted by name
+  if (activeClientId !== null && activeClientId !== account?.last_client_id) {
     await accounts.setLastClient(pool, accountId, activeClientId);
-  } else {
-    activeClientId = (await accounts.getAccount(pool, accountId))?.last_client_id ?? null;
   }
 
   // A plain sign-in starts a session. "Connect another org" happens inside one, so it keeps it.

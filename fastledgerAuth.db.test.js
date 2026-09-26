@@ -128,6 +128,35 @@ test('every org the login has authorised is used, including ones connected befor
     assert.equal(r.connected.length, 2);
   }));
 
+test('sign-in opens the last-used org, or the first by name; the account keeps the login\'s name', { skip }, () =>
+  inTx(async (db) => {
+    const first = await run(db, { orgs: [org('t2', 'Zeta'), org('t1', 'Alpha')], subject: 'name-test' });
+    assert.equal(first.activeClientId, first.connected.find((c) => c.name === 'Alpha').clientId, 'no last-used org yet: first by name, not Xero\'s order');
+    assert.equal((await accounts.getAccount(db, first.accountId)).display_name, 'name-test');
+
+    const zeta = first.connected.find((c) => c.name === 'Zeta').clientId;
+    await accounts.setLastClient(db, first.accountId, zeta);
+    const again = await run(db, { orgs: [org('t1', 'Alpha'), org('t2', 'Zeta')], subject: 'name-test' });
+    assert.equal(again.activeClientId, zeta, 'the org used last stays');
+  }));
+
+test('an account without a name gets it at the next sign-in', { skip }, () =>
+  inTx(async (db) => {
+    const { accountId } = await accounts.findOrCreateAccountForIdentity(db, { subject: 'old-1', email: 'o@example.test' });
+    assert.equal((await accounts.getAccount(db, accountId)).display_name, null);
+    await accounts.findOrCreateAccountForIdentity(db, { subject: 'old-1', email: 'o@example.test', displayName: 'Old One' });
+    assert.equal((await accounts.getAccount(db, accountId)).display_name, 'Old One');
+    await accounts.findOrCreateAccountForIdentity(db, { subject: 'old-1', displayName: 'Changed' });
+    assert.equal((await accounts.getAccount(db, accountId)).display_name, 'Old One', 'an existing name is not overwritten');
+  }));
+
+test('add-org lands on the newly added org, not on the last-used one', { skip }, () =>
+  inTx(async (db) => {
+    const first = await run(db, { orgs: [org('t1', 'One')] });
+    const r = await run(db, { orgs: [org('t1', 'One'), org('t2', 'Two')] }, { intent: 'add', accountId: first.accountId });
+    assert.equal(r.activeClientId, r.connected.find((c) => c.name === 'Two').clientId);
+  }));
+
 test('an unreadable Organisation leaves the base currency empty rather than guessing', { skip }, () =>
   inTx(async (db) => {
     const r = await run(db, { orgs: [org('t1', 'Org One')], currency: null });

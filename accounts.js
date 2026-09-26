@@ -62,7 +62,11 @@ async function findOrCreateAccountForIdentity(db, { subject, email = null, displ
   RETURNING account_id`,
     [provider, subject, email, displayName]
   );
-  if (existing.rows.length > 0) return { accountId: existing.rows[0].account_id, created: false };
+  if (existing.rows.length > 0) {
+    // An account made before names were stored fills its name in at the next sign-in.
+    await db.query(`UPDATE accounts SET display_name = COALESCE(display_name, $2) WHERE id = $1`, [existing.rows[0].account_id, displayName]);
+    return { accountId: existing.rows[0].account_id, created: false };
+  }
 
   const account = await db.query(`INSERT INTO accounts (display_name, email) VALUES ($1, $2) RETURNING id`, [displayName, email]);
   const accountId = account.rows[0].id;
