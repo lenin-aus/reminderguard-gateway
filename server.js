@@ -21,6 +21,7 @@ const { todayInTimezone } = require('./statementRange');
 const { buildCustomerBuckets } = require('./customerBuckets');
 const { lastSentLabel } = require('./lastSent');
 const { requestLog } = require('./requestLog');
+const { startFlow, redeemConnectTicket } = require('./oauthFlow');
 
 const app = express();
 app.use(express.json());
@@ -108,17 +109,36 @@ const BUCKET_KEY_REGEX = /^(.+)_([A-Za-z]{3})$/;
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // ── Self-serve: public "Connect to Xero" entry point ───────────────────────
-app.get('/oauth/connect', (req, res) => {
-  const nonce = crypto.randomBytes(16).toString('hex');
+app.get('/oauth/connect', async (req, res) => {
   const returnApp = req.query.returnApp === 'fastledger' ? 'fastledger' : 'reminderguard';
-  const state = encodeState({ mode: 'self_serve', nonce, returnApp });
-  res.cookie('oauth_state', nonce, {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'Lax',
-    maxAge: 10 * 60 * 1000,
-  });
-  res.redirect(xero.buildAuthUrl(state));
+  const cookieOptions = { httpOnly: true, secure: true, sameSite: 'Lax', maxAge: 10 * 60 * 1000 };
+
+  // The self-serve app (returnApp=reminderguard) keeps the original flow, unchanged.
+  if (returnApp !== 'fastledger') {
+    const nonce = crypto.randomBytes(16).toString('hex');
+    res.cookie('oauth_state', nonce, cookieOptions);
+    return res.redirect(xero.buildAuthUrl(encodeState({ mode: 'self_serve', nonce, returnApp })));
+  }
+
+  // fastledger asks Xero who is signing in (the id_token) as well as for access. "Connect another
+  // org" (intent=add) starts from a one-time ticket the signed-in app asked for, which binds the
+  // round trip to that account without putting the session token in a URL.
+  try {
+    const intent = req.query.intent === 'add' ? 'add' : 'signin';
+    let accountId = null;
+    if (intent === 'add') {
+      accountId = await redeemConnectTicket(redis, String(req.query.ticket || ''));
+      if (accountId === null) {
+        return res.status(400).send('This link has expired. Go back to FastLedger and choose "Connect another org" again.');
+      }
+    }
+    const { nonce, oidcNonce } = await startFlow(redis, { intent, accountId, returnApp });
+    res.cookie('oauth_state', nonce, cookieOptions);
+    res.redirect(xero.buildAuthUrl(encodeState({ mode: 'self_serve', nonce, returnApp, intent }), { identity: true, nonce: oidcNonce }));
+  } catch (e) {
+    console.error('OAuth connect error:', e);
+    res.status(500).send('Could not start the Xero connection. Please try again.');
+  }
 });
 
 // ── Practice: one bookkeeper (e.g. Marissa) authorizes access to MANY orgs ─
