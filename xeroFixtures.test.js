@@ -33,3 +33,12 @@ test('fixtures refuse anything but GET', async () => {
   const res = await createFixtureFetch()('https://api.xero.com/api.xro/2.0/Invoices', { method: 'POST' });
   assert.equal(res.status, 405);
 });
+
+test('an organisation with a contact scope sees only those contacts, others see everything', async () => {
+  const ctxFor = (tenantId) => ({ clientId: 6, tenantId, accessToken: 'x' });
+  const names = async (tenantId) => (await data.listOpenInvoices(ctxFor(tenantId))).map((i) => i.contactName);
+  const scoped = new Set(await names('dev-tenant-6'));
+  assert.deepEqual([...scoped].sort(), ['Bayside Club', 'Harbour Freight']);
+  assert.ok((await names('dev-tenant-7')).includes('City Limousines'));
+  await assert.rejects(data.getContact(ctxFor('dev-tenant-6'), ids.cityLimo), /not found/);
+});

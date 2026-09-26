@@ -136,6 +136,16 @@ async function completeFastledgerSignIn(deps, { csrfNonce, tokenResponse }) {
   return { ok: true, intent: flow.intent, accountId, sessionToken, connected, skipped, activeClientId };
 }
 
+// Where the browser goes after a completed sign-in: a new session token, or, when an org was added
+// inside an existing session, how many orgs were connected and skipped.
+function redirectUrlFor(result, fastledgerUrl) {
+  const url = new URL(fastledgerUrl);
+  if (result.sessionToken) url.searchParams.set('token', result.sessionToken);
+  else url.searchParams.set('connected', String(result.connected.length));
+  if (result.skipped.length) url.searchParams.set('skipped', String(result.skipped.length));
+  return url.toString();
+}
+
 // Runs fn(db) in one transaction on a dedicated connection.
 function makeTransaction(pool) {
   return async (fn) => {
@@ -154,4 +164,4 @@ function makeTransaction(pool) {
   };
 }
 
-module.exports = { completeFastledgerSignIn, makeTransaction, REJECT_MESSAGE };
+module.exports = { completeFastledgerSignIn, makeTransaction, redirectUrlFor, REJECT_MESSAGE };

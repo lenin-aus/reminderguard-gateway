@@ -24,7 +24,7 @@ const { requestLog } = require('./requestLog');
 const { startFlow, redeemConnectTicket } = require('./oauthFlow');
 const accounts = require('./accounts');
 const { verifyXeroIdToken } = require('./oidc');
-const { completeFastledgerSignIn, makeTransaction } = require('./fastledgerAuth');
+const { completeFastledgerSignIn, makeTransaction, redirectUrlFor } = require('./fastledgerAuth');
 const { createAccountHandlers } = require('./accountRoutes');
 
 const app = express();
@@ -204,11 +204,7 @@ app.get('/oauth/callback', async (req, res) => {
         { csrfNonce: parsedState.nonce, tokenResponse }
       );
       if (!result.ok) return res.status(result.status).send(result.message);
-      const base = new URL(FASTLEDGER_URL);
-      if (result.sessionToken) base.searchParams.set('token', result.sessionToken);
-      else base.searchParams.set('connected', String(result.connected.length));
-      if (result.skipped.length) base.searchParams.set('skipped', String(result.skipped.length));
-      return res.redirect(base.toString());
+      return res.redirect(redirectUrlFor(result, FASTLEDGER_URL));
     }
 
     const orgs = await xero.fetchConnections(tokenResponse.access_token);
@@ -412,6 +408,11 @@ app.post('/oauth/select-org', async (req, res) => {
 // ── Self-serve session check — Appsmith's onPageLoad calls this ───────────
 const accountHandlers = createAccountHandlers({ db: pool, redis, accounts });
 app.get('/session/whoami', resolveSession, accountHandlers.whoami);
+// Local dev stack only (XERO_FIXTURES=1): stands in for the Xero round trip so the sign-in and
+// "connect another org" paths can be exercised without Xero. Never registered in production.
+if (process.env.XERO_FIXTURES === '1') {
+  require('./devAuth').registerDevAuth(app, { pool, redis, xero, tokenManager, accounts, FASTLEDGER_URL });
+}
 app.post('/accounts/me/connect-ticket', resolveSession, accountHandlers.connectTicket);
 app.put('/accounts/me/last-client', resolveSession, accountHandlers.setLastClient);
 

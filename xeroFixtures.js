@@ -55,12 +55,21 @@ const prepayments = [
   { PrepaymentID: guid(302), Reference: 'Deposit', Type: 'RECEIVE-PREPAYMENT', Status: 'AUTHORISED', Contact: { ContactID: ids.harbour }, CurrencyCode: 'AUD', DateString: '2026-09-02T00:00:00', Total: 100, RemainingCredit: 100, Allocations: [] },
 ];
 
+// The dev seed's other organisations see only some of the contacts, so switching organisations
+// visibly changes the customer list. Any other tenant (dev-tenant-7, a sign-in that created a new
+// org) sees everything.
+const TENANT_CONTACTS = {
+  'dev-tenant-6': [ids.bayside, ids.harbour],
+  'dev-tenant-5': [ids.pinnacle],
+};
+const visibleTo = (tenantId, contactId) => !TENANT_CONTACTS[tenantId] || TENANT_CONTACTS[tenantId].includes(contactId);
+
 const SOURCES = { Invoices: invoices, CreditNotes: creditNotes, Overpayments: overpayments, Prepayments: prepayments };
 
 // Understands the filters xeroData.js uses: ContactIDs/Statuses on Invoices, and
 // where=Contact.ContactID==Guid("..") [AND Status=="..."] on the credit endpoints.
-function filterList(path, query) {
-  let items = SOURCES[path] || [];
+function filterList(path, query, tenantId) {
+  let items = (SOURCES[path] || []).filter((x) => visibleTo(tenantId, x.Contact?.ContactID));
   const contactIds = query.get('ContactIDs');
   if (contactIds) {
     const wanted = contactIds.split(',');
@@ -93,19 +102,20 @@ function createFixtureFetch() {
     const u = new URL(url);
     const path = u.pathname.replace('/api.xro/2.0/', '');
     const query = u.searchParams;
+    const tenantId = init.headers?.['Xero-tenant-id'];
 
     if (path.startsWith('Contacts/')) {
       const id = path.slice('Contacts/'.length);
-      const found = contacts.filter((c) => c.ContactID === id);
+      const found = contacts.filter((c) => c.ContactID === id && visibleTo(tenantId, c.ContactID));
       return found.length ? json(200, { Contacts: found }) : json(404, { Title: 'Not found' });
     }
     if (path === 'Contacts') {
       const wanted = String(query.get('IDs') || '').split(',');
-      return json(200, { Contacts: contacts.filter((c) => wanted.includes(c.ContactID)) });
+      return json(200, { Contacts: contacts.filter((c) => wanted.includes(c.ContactID) && visibleTo(tenantId, c.ContactID)) });
     }
     if (path === 'Organisation') return json(200, { Organisations: [{ BaseCurrency: 'AUD', Name: 'Fixture Organisation', ShortCode: '!fixture' }] });
     if (SOURCES[path]) {
-      const all = filterList(path, query);
+      const all = filterList(path, query, tenantId);
       const page = Number(query.get('page') || 1);
       return json(200, { [path]: all.slice((page - 1) * 100, page * 100) });
     }

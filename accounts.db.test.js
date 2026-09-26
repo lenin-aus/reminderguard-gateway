@@ -27,6 +27,8 @@ async function inTx(fn) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // The dev seed gives some orgs owners; these tests set up their own ownership.
+    await client.query('DELETE FROM account_clients');
     await fn(client);
   } finally {
     await client.query('ROLLBACK');
