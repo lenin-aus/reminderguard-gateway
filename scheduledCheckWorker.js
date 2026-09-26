@@ -244,4 +244,7 @@ scheduledCheckWorker.on('error', (err) => {
   console.error('[Heartbeat] Worker-level ERROR:', err?.message, err?.stack);
 });
 
+// The Xero sync planner runs in this same process, on its own queue.
+require('./xeroSyncWorker');
+
 module.exports = scheduledCheckWorker;

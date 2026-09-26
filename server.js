@@ -11,11 +11,14 @@ const tokenManager = require('./tokenManager');
 const { encrypt, decrypt } = require('./crypto');
 const { isConfigComplete } = require('./config');
 const { createSession, createAccountSession, resolveSession, requireClientAccess, startSessionCleanupJob } = require('./session');
-const { registerHeartbeat } = require('./scheduler');
+const { registerHeartbeat, registerXeroSyncPlanner } = require('./scheduler');
 const { getOrFetchBaseCurrency, getTenantTodayDateString } = require('./shared');
 const { validateScheduleConfig, toApiConfig, READ_KEYS } = require('./scheduleConfig');
 const { getXeroContext, getXeroTenantId, CALLS_PER_STATEMENT } = require('./xeroContext');
-const { getXeroData } = require('./xeroData');
+const { getXeroData, getXeroRedis } = require('./xeroData');
+const { getXeroSource, readSyncStatus } = require('./xeroSource');
+const { diffCustomers, formatShadowLog } = require('./xeroShadow');
+const { acquireSyncLock } = require('./xeroSyncPlan');
 const { validateStatementOptions, statementOptionsHash, statementLockKey, StatementOptionsError } = require('./statementOptions');
 const { todayInTimezone } = require('./statementRange');
 const { buildCustomerBuckets } = require('./customerBuckets');
@@ -43,6 +46,16 @@ const N8N_API_KEY = process.env.N8N_API_KEY;
 const FASTLEDGER_URL = process.env.FASTLEDGER_URL;
 
 const autoStatementsQueue = new Queue('auto-statements', {
+  connection: {
+    host: process.env.REDIS_HOST,
+    port: process.env.REDIS_PORT || 6379,
+    username: process.env.REDIS_USERNAME,
+    password: process.env.REDIS_PASSWORD
+  }
+});
+
+// The Xero sync planner (xeroSyncPlan.js); its worker runs inside scheduledCheckWorker.js.
+const xeroSyncQueue = new Queue('xero-sync-planner', {
   connection: {
     host: process.env.REDIS_HOST,
     port: process.env.REDIS_PORT || 6379,
@@ -620,25 +633,47 @@ app.all('/proxy/xero/:clientId/*', resolveSession, requireClientAccess, async (r
 });
 
 // The Xero side of the customer list: open invoices, remaining credits, and which contacts have
-// an email. Cached in Redis so post-send polling never calls Xero; a fresh load refreshes it.
-const CUSTOMER_CACHE_TTL_S = 10 * 60;
-async function loadCustomerSource(clientId, { useCache }) {
-  const cacheKey = `xero:cache:customers:${clientId}`;
-  if (useCache) {
-    const hit = await redis.get(cacheKey);
-    if (hit) return JSON.parse(hit);
-  }
-  const data = getXeroData();
-  const ctx = await getXeroContext(clientId);
+// an email. Read through whichever data layer the organisation is on (xeroSource.js).
+async function readCustomerSource(data, ctx) {
   const [invoices, credits] = await Promise.all([data.listOpenInvoices(ctx), data.listOpenCredits(ctx)]);
   const contactIds = [...new Set(invoices.map((i) => i.contactId).filter(Boolean))];
   const emailByContactId = {};
   for (const contact of await data.getContactsByIds(ctx, contactIds)) {
     emailByContactId[contact.id] = contact.email.length > 0;
   }
-  const source = { invoices, credits, emailByContactId };
-  await redis.set(cacheKey, JSON.stringify(source), 'EX', CUSTOMER_CACHE_TTL_S).catch(() => {});
-  return source;
+  return { invoices, credits, emailByContactId };
+}
+
+// live: read from Xero, cached in Redis so post-send polling never calls Xero (a fresh load refreshes
+// it). local: read from the synced copy: no Xero call, no cache. shadow: as live, plus the copy is
+// read so the two can be compared (returned as `shadow`).
+// -> { invoices, credits, emailByContactId, source: 'live' | 'local', syncedAt, shadow }
+const CUSTOMER_CACHE_TTL_S = 10 * 60;
+async function loadCustomerSource(clientId, { useCache }) {
+  const xeroSource = await getXeroSource().forClient(clientId);
+
+  if (xeroSource.effective === 'local') {
+    const local = await readCustomerSource(xeroSource.data, { clientId });
+    return { ...local, source: 'local', syncedAt: xeroSource.syncedAt, shadow: null };
+  }
+
+  const cacheKey = `xero:cache:customers:${clientId}`;
+  if (useCache) {
+    const hit = await redis.get(cacheKey);
+    if (hit) return { ...JSON.parse(hit), source: 'live', syncedAt: null, shadow: null };
+  }
+  const ctx = await getXeroContext(clientId);
+  const liveSource = await readCustomerSource(xeroSource.data, ctx);
+  await redis.set(cacheKey, JSON.stringify(liveSource), 'EX', CUSTOMER_CACHE_TTL_S).catch(() => {});
+
+  let shadow = null;
+  if (xeroSource.localData) {
+    shadow = await readCustomerSource(xeroSource.localData, { clientId }).catch((e) => {
+      console.warn(`[xero-shadow] client=${clientId} could not read the copy: ${e.message}`);
+      return null;
+    });
+  }
+  return { ...liveSource, source: 'live', syncedAt: xeroSource.syncedAt, shadow };
 }
 
 // ── Self-serve Auto Statements customer list ──────────────────────────────
@@ -656,16 +691,13 @@ app.get('/clients/:clientId/statements/customers', resolveSession, requireClient
     // the last fresh load and costs no Xero calls.
     const source = await loadCustomerSource(clientId, { useCache: req.query.poll === '1' });
 
+    const today = todayInTimezone(timezone);
+    const bucketsOf = (from) => buildCustomerBuckets({ invoices: from.invoices, credits: from.credits, emailByContactId: from.emailByContactId, today, baseCurrency });
+    const list = bucketsOf(source);
+    if (source.shadow) console.log(formatShadowLog(clientId, diffCustomers(list, bucketsOf(source.shadow)), source.syncedAt));
+
     const buckets = {};
-    for (const customer of buildCustomerBuckets({
-      invoices: source.invoices,
-      credits: source.credits,
-      emailByContactId: source.emailByContactId,
-      today: todayInTimezone(timezone),
-      baseCurrency,
-    })) {
-      buckets[customer.bucketKey] = customer;
-    }
+    for (const customer of list) buckets[customer.bucketKey] = customer;
 
     // Compute "Last sent" per bucketKey from the latest statement_logs row.
     const bucketKeys = Object.keys(buckets);
@@ -690,13 +722,47 @@ app.get('/clients/:clientId/statements/customers', resolveSession, requireClient
       lastSent: lastSentByBucketKey[b.bucketKey] || 'Never',
     }));
 
-    res.json({ customers });
+    // synced_at is set when the list came from the synced copy: how old the copy can be at worst.
+    res.json({ customers, synced_at: source.syncedAt ? new Date(source.syncedAt).toISOString() : null, source: source.source });
   } catch (e) {
     console.error('Statements customers error:', e);
     if (e.code === 'XERO_DAILY_LIMIT') return res.status(429).json({ error: e.message, code: e.code });
     if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
     if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
     res.status(502).json({ error: e.message, code: e.code || 'GATEWAY_ERROR' });
+  }
+});
+
+// ── Refresh: bring the synced copy of this org's Xero data up to date now ──────────────────────
+// Runs an incremental sync (the first ever run is the full backfill, which can take a while).
+// One sync per org at a time, so the Refresh button, the planner and a second tab cannot pile up.
+app.post('/clients/:clientId/xero-sync', resolveSession, requireClientAccess, async (req, res) => {
+  const clientId = req.client_id;
+  let release = null;
+  try {
+    release = await acquireSyncLock(getXeroRedis(), clientId);
+    if (!release) return res.status(409).json({ error: 'A sync is already running for this organisation.', code: 'SYNC_IN_PROGRESS' });
+
+    const ctx = await getXeroContext(clientId);
+    const summary = await getXeroSource().sync.syncClient(ctx, { mode: 'incremental' });
+    await redis.del(`xero:cache:customers:${clientId}`).catch(() => {});
+
+    const failed = Object.entries(summary.errors);
+    if (failed.length > 0) {
+      const [resource, code] = failed[0];
+      const status = code === 'XERO_DAILY_LIMIT' ? 429 : code === 'XERO_UNAUTHORIZED' ? 401 : 502;
+      return res.status(status).json({ error: `Xero sync failed for ${failed.map(([r]) => r).join(', ')}.`, code: status === 401 ? 'RECONNECT_REQUIRED' : code });
+    }
+    const status = await readSyncStatus(pool, clientId);
+    res.json({ synced_at: status.syncedAt ? status.syncedAt.toISOString() : null, full: Object.values(summary.resources).some((r) => r.full) });
+  } catch (e) {
+    console.error('Xero sync error:', e);
+    if (e.code === 'XERO_DAILY_LIMIT') return res.status(429).json({ error: e.message, code: e.code });
+    if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
+    if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
+    res.status(502).json({ error: e.message, code: e.code || 'GATEWAY_ERROR' });
+  } finally {
+    if (release) await release().catch(() => {});
   }
 });
 
@@ -826,6 +892,9 @@ app.post('/webhooks/xero', express.raw({ type: '*/*' }), async (req, res) => {
 startSessionCleanupJob();
 registerHeartbeat(schedulerQueue).catch((e) =>
   console.error('[Heartbeat] Failed to register heartbeat job at boot:', e.message)
+);
+registerXeroSyncPlanner(xeroSyncQueue).catch((e) =>
+  console.error('[xero-sync] Failed to register planner job at boot:', e.message)
 );
 
 const PORT = process.env.PORT || 4000;

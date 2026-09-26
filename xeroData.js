@@ -136,6 +136,10 @@ function normalizeCredit(kind, x) {
   };
 }
 
+function normalizeContact(c) {
+  return { id: c.ContactID, name: c.Name || '', email: (c.EmailAddress || '').trim(), archived: c.ContactStatus === 'ARCHIVED' };
+}
+
 // Contact ids are interpolated into Xero 'where' filters, so they must be plain GUIDs.
 const GUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 function assertGuid(id) {
@@ -156,13 +160,7 @@ function createXeroData(client) {
     async getContact(ctx, contactId) {
       const data = await client.request(ctx, `Contacts/${assertGuid(contactId)}`);
       const c = (data.Contacts || [])[0];
-      if (!c) return null;
-      return {
-        id: c.ContactID,
-        name: c.Name || '',
-        email: (c.EmailAddress || '').trim(),
-        archived: c.ContactStatus === 'ARCHIVED',
-      };
+      return c ? normalizeContact(c) : null;
     },
 
     // Every AUTHORISED receivable invoice with a balance, for one contact.
@@ -207,9 +205,7 @@ function createXeroData(client) {
       for (let i = 0; i < contactIds.length; i += chunkSize) {
         const chunk = contactIds.slice(i, i + chunkSize).map(assertGuid);
         const data = await client.request(ctx, 'Contacts', { query: { IDs: chunk.join(',') } });
-        for (const c of data.Contacts || []) {
-          found.push({ id: c.ContactID, name: c.Name || '', email: (c.EmailAddress || '').trim(), archived: c.ContactStatus === 'ARCHIVED' });
-        }
+        for (const c of data.Contacts || []) found.push(normalizeContact(c));
       }
       return found;
     },
@@ -238,14 +234,17 @@ function createXeroData(client) {
   };
 }
 
+let defaultClient = null;
+let defaultRedis = null;
 let defaultData = null;
-// The production instance, wired to Redis. Created on first use so that requiring this
-// module (for tests, or by a process that never calls Xero) does not open a connection.
-function getXeroData() {
-  if (!defaultData) {
+
+// The production Xero client, wired to Redis. Created on first use so that requiring this module
+// (for tests, or by a process that never calls Xero) does not open a connection.
+function getXeroClient() {
+  if (!defaultClient) {
     const Redis = require('ioredis');
     const { createRedisLimiter } = require('./xeroLimiter');
-    const redis = new Redis({
+    defaultRedis = new Redis({
       host: process.env.REDIS_HOST,
       port: process.env.REDIS_PORT || 6379,
       username: process.env.REDIS_USERNAME,
@@ -256,9 +255,23 @@ function getXeroData() {
     const fixtures = process.env.XERO_FIXTURES === '1';
     if (fixtures) console.warn('[xero] XERO_FIXTURES=1: answering from fixture data, not from Xero');
     const fetchImpl = fixtures ? require('./xeroFixtures').createFixtureFetch() : undefined;
-    defaultData = createXeroData(createXeroClient({ limiter: createRedisLimiter(redis), ...(fetchImpl ? { fetchImpl } : {}) }));
+    defaultClient = createXeroClient({ limiter: createRedisLimiter(defaultRedis), ...(fetchImpl ? { fetchImpl } : {}) });
   }
+  return defaultClient;
+}
+
+// The Redis connection the client's limiter uses, for locks that belong with Xero work.
+function getXeroRedis() {
+  getXeroClient();
+  return defaultRedis;
+}
+
+function getXeroData() {
+  if (!defaultData) defaultData = createXeroData(getXeroClient());
   return defaultData;
 }
 
-module.exports = { createXeroData, getXeroData, xeroLocalDate, normalizeInvoice, normalizeCredit, cents, HISTORY_WARN_PAGES };
+module.exports = {
+  createXeroData, getXeroData, getXeroClient, getXeroRedis, xeroLocalDate, xeroInstant, normalizeInvoice, normalizeCredit, normalizeContact,
+  CREDIT_KINDS, POSTED_CREDIT_STATUSES, cents, HISTORY_WARN_PAGES,
+};

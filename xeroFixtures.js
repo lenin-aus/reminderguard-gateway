@@ -64,12 +64,16 @@ const TENANT_CONTACTS = {
 };
 const visibleTo = (tenantId, contactId) => !TENANT_CONTACTS[tenantId] || TENANT_CONTACTS[tenantId].includes(contactId);
 
+const ID_FIELD = { Invoices: 'InvoiceID', CreditNotes: 'CreditNoteID', Overpayments: 'OverpaymentID', Prepayments: 'PrepaymentID' };
+
 const SOURCES = { Invoices: invoices, CreditNotes: creditNotes, Overpayments: overpayments, Prepayments: prepayments };
 
 // Understands the filters xeroData.js uses: ContactIDs/Statuses on Invoices, and
 // where=Contact.ContactID==Guid("..") [AND Status=="..."] on the credit endpoints.
 function filterList(path, query, tenantId) {
   let items = (SOURCES[path] || []).filter((x) => visibleTo(tenantId, x.Contact?.ContactID));
+  const ids = query.get('IDs');
+  if (ids) items = items.filter((x) => ids.split(',').includes(x[ID_FIELD[path]]));
   const contactIds = query.get('ContactIDs');
   if (contactIds) {
     const wanted = contactIds.split(',');
@@ -110,10 +114,19 @@ function createFixtureFetch() {
       return found.length ? json(200, { Contacts: found }) : json(404, { Title: 'Not found' });
     }
     if (path === 'Contacts') {
-      const wanted = String(query.get('IDs') || '').split(',');
-      return json(200, { Contacts: contacts.filter((c) => wanted.includes(c.ContactID) && visibleTo(tenantId, c.ContactID)) });
+      // With IDs: those contacts. Without: every contact (what the sync's full pull reads), paged.
+      const ids = query.get('IDs');
+      let list = contacts.filter((c) => visibleTo(tenantId, c.ContactID));
+      if (ids) list = list.filter((c) => ids.split(',').includes(c.ContactID));
+      const page = Number(query.get('page') || 1);
+      return json(200, { Contacts: ids ? list : list.slice((page - 1) * 100, page * 100) });
     }
     if (path === 'Organisation') return json(200, { Organisations: [{ BaseCurrency: 'AUD', Name: 'Fixture Organisation', ShortCode: '!fixture' }] });
+    const [listName, itemId] = path.split('/');
+    if (itemId && SOURCES[listName]) {
+      const found = SOURCES[listName].find((x) => x[ID_FIELD[listName]] === itemId && visibleTo(tenantId, x.Contact?.ContactID));
+      return found ? json(200, { [listName]: [found] }) : json(404, { Title: 'Not found' });
+    }
     if (SOURCES[path]) {
       const all = filterList(path, query, tenantId);
       const page = Number(query.get('page') || 1);

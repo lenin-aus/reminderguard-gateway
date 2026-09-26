@@ -1,5 +1,7 @@
 const { getXeroContext } = require('./xeroContext');
-const { getXeroData } = require('./xeroData');
+const { getXeroSource } = require('./xeroSource');
+const { getXeroRedis } = require('./xeroData');
+const { acquireSyncLock } = require('./xeroSyncPlan');
 const { getOrFetchBaseCurrency, getTenantTodayDateString } = require('./shared');
 const { daysBetween } = require('./statementModel');
 
@@ -14,8 +16,26 @@ const { daysBetween } = require('./statementModel');
 // credit notes, overpayments and prepayments, matching the statement itself, so a customer whose
 // credits cover what they owe is not selected. Amounts here are dollars.
 async function getFilteredContacts(clientId, recipientFilter, timeZone = 'Australia/Melbourne') {
-  const data = getXeroData();
-  const ctx = await getXeroContext(clientId);
+  const xeroSource = await getXeroSource().forClient(clientId);
+  const data = xeroSource.data;
+  let ctx;
+  if (xeroSource.effective === 'local') {
+    // Bring the copy up to date first, so a scheduled run never selects from data that is hours old.
+    // If that fails (Xero down, a sync already running) the copy as it is still gives a usable list.
+    ctx = { clientId };
+    const release = await acquireSyncLock(getXeroRedis(), clientId).catch(() => null);
+    if (release) {
+      try {
+        await getXeroSource().sync.syncClient(await getXeroContext(clientId), { mode: 'incremental' });
+      } catch (e) {
+        console.warn(`[recipients] client ${clientId}: could not refresh the copy before selecting (${e.message}); using it as it is`);
+      } finally {
+        await release().catch(() => {});
+      }
+    }
+  } else {
+    ctx = await getXeroContext(clientId);
+  }
   const baseCurrency = await getOrFetchBaseCurrency(clientId);
 
   const [invoices, credits] = await Promise.all([data.listOpenInvoices(ctx), data.listOpenCredits(ctx)]);

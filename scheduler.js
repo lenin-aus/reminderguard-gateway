@@ -16,7 +16,19 @@ async function registerHeartbeat(schedulerQueue) {
   console.log('[Heartbeat] Registered global heartbeat job (* * * * *)');
 }
 
-module.exports = { registerHeartbeat };
+// The Xero sync planner: every five minutes, decides which organisations are due (xeroSyncPlan.js).
+const XERO_SYNC_PLANNER_JOB_ID = 'xero-sync-planner';
+
+async function registerXeroSyncPlanner(queue) {
+  await queue.upsertJobScheduler(
+    XERO_SYNC_PLANNER_JOB_ID,
+    { pattern: '*/5 * * * *' },
+    { name: 'plan', data: {}, opts: { removeOnComplete: { count: 5 }, removeOnFail: { count: 20 } } }
+  );
+  console.log('[xero-sync] Registered planner job (*/5 * * * *)');
+}
+
+module.exports = { registerHeartbeat, registerXeroSyncPlanner };
 
 // const HEARTBEAT_JOB_ID = 'auto-statements-heartbeat';
 

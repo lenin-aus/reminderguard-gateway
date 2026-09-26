@@ -4,7 +4,7 @@ const Redis = require('ioredis');
 const pool = require('./db');
 const fetch = require('node-fetch');
 const { getXeroContext, getXeroTenantId } = require('./xeroContext');
-const { getXeroData } = require('./xeroData');
+const { getXeroSource } = require('./xeroSource');
 const { buildStatementModel } = require('./statementModel');
 const { renderStatementHtml } = require('./statementHtml');
 const { renderTemplate, toSubject, bodyToHtml } = require('./statementTemplate');
@@ -84,7 +84,9 @@ const worker = new Worker('auto-statements', async (job) => {
     }
   }
 
-  const data = getXeroData();
+  // live: read Xero. local: read the synced copy, after refreshing this one contact live (below).
+  const xeroSource = await getXeroSource().forClient(clientId);
+  const data = xeroSource.data;
   let emailSent = false;
   let tenantId = null;
   // The calls this job reserved against the daily quota are given back once it is finished
@@ -107,6 +109,10 @@ const worker = new Worker('auto-statements', async (job) => {
     tenantId = await getXeroTenantId(clientId);
     const ctx = await getXeroContext(clientId);
     await data.assertBudget(ctx);
+
+    // A statement is never built from data older than this moment: the contact, its history and its
+    // credits are re-read from Xero into the copy first (the same calls a live read makes).
+    if (xeroSource.effective === 'local') await getXeroSource().sync.refreshContact(ctx, contactId);
 
     // Fresh contact lookup — email always sourced here, never from the
     // enqueue-time payload, in case the customer's email changed in Xero.
