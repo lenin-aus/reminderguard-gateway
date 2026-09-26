@@ -19,6 +19,7 @@ const { getXeroData } = require('./xeroData');
 const { validateStatementOptions, statementOptionsHash, statementLockKey, StatementOptionsError } = require('./statementOptions');
 const { todayInTimezone } = require('./statementRange');
 const { buildCustomerBuckets } = require('./customerBuckets');
+const { lastSentLabel } = require('./lastSent');
 
 const app = express();
 app.use(express.json());
@@ -650,32 +651,8 @@ app.get('/clients/:clientId/statements/customers', resolveSession, async (req, r
       );
 
       const nowMs = Date.now();
-      const todayStr = getTenantTodayDateString();
-
       for (const row of logRows) {
-        let lastSent;
-        if (row.status === 'PROCESSING') {
-          const ageMs = nowMs - new Date(row.created_at).getTime();
-          lastSent = ageMs <= 15 * 60 * 1000 ? 'Sending...' : 'Failed';
-        } else if (row.status === 'FAILED') {
-          lastSent = row.error_reason === 'MISSING_EMAIL' ? 'Never' : 'Failed today';
-        } else if (row.status === 'DELIVERED') {
-          const createdDateStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Australia/Melbourne' }).format(
-            new Date(row.created_at)
-          );
-          if (createdDateStr === todayStr) {
-            lastSent = 'Today';
-          } else {
-            const daysAgo = Math.max(
-              1,
-              Math.round((nowMs - new Date(row.created_at).getTime()) / (1000 * 60 * 60 * 24))
-            );
-            lastSent = `${daysAgo} day${daysAgo === 1 ? '' : 's'} ago`;
-          }
-        } else {
-          lastSent = 'Never';
-        }
-        lastSentByBucketKey[row.bucket_key] = lastSent;
+        lastSentByBucketKey[row.bucket_key] = lastSentLabel(row, { nowMs, timeZone: timezone });
       }
     }
 
