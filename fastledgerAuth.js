@@ -6,12 +6,12 @@
 //
 //   1. The round trip's server-side record (oauthFlow) says what this sign-in was for.
 //   2. The id_token says WHO signed in (oidc.js). The account is found or created from that login.
-//   3. Each org Xero returned for THIS consent is decided by the ownership rule (accounts.js):
+//   3. Each org this login has authorised (Xero's connections list) is decided by the ownership rule (accounts.js):
 //        create     a new org row, owned by this account
 //        claim      an org from before accounts, now owned by this account
 //        reconnect  an org this account already has: refresh its access
 //        reject     another account owns it: nothing is touched, and the refusal is recorded
-//      New tokens always become a NEW connection and only the orgs of this consent are re-pointed to
+//      New tokens always become a NEW connection and the orgs accepted here are re-pointed to
 //      it, so reconnecting one org cannot break another that shared the old connection.
 //   4. A session for the account (a plain sign-in) and where the user goes next.
 
@@ -54,7 +54,10 @@ async function completeFastledgerSignIn(deps, { csrfNonce, tokenResponse }) {
   }
 
   // 3. The orgs ticked in this consent.
-  const orgs = await xero.fetchConnections(tokenResponse.access_token, xero.authEventIdFromToken(tokenResponse.access_token));
+  // Every org this Xero login has authorised for the app, not only those ticked this time: Xero
+  // keeps an already-connected org's original consent id, so filtering by this consent's id
+  // returned nothing when all the orgs were already connected.
+  const orgs = await xero.fetchConnections(tokenResponse.access_token);
   if (!orgs.length) return fail(400, 'NO_ORGS', 'No Xero organisation was authorised.');
 
   let connectionId = null; // created for the first org that is accepted, shared by all of them

@@ -53,9 +53,11 @@ const org = (key, name) => ({ tenantId: TENANTS[key], tenantName: name });
 // undoable without aborting the whole test transaction, as the real per-org transaction does.
 function makeDeps(db, { orgs, subject = 'sub-1', idTokenError = null, currency = 'AUD' }) {
   const redis = fakeRedis();
+  const calls = [];
   let sessions = 0;
   return {
     redis,
+    calls,
     deps: {
       pool: db,
       redis,
@@ -64,8 +66,8 @@ function makeDeps(db, { orgs, subject = 'sub-1', idTokenError = null, currency =
       log: { warn() {}, error() {} },
       senderDefaults: { email: 'noreply@example.test', name: 'FastLedger' },
       xero: {
-        fetchConnections: async () => orgs,
-        authEventIdFromToken: () => 'evt-1',
+        // Records what it was called with: the filter by consent id must not come back.
+        fetchConnections: async (...args) => { calls.push(args); return orgs; },
         fetchOrganisation: async () => (currency ? { BaseCurrency: currency } : Promise.reject(new Error('down'))),
       },
       verifyIdToken: async () => {
@@ -91,9 +93,11 @@ function makeDeps(db, { orgs, subject = 'sub-1', idTokenError = null, currency =
 const tokenResponse = { access_token: 'a.b.c', refresh_token: 'r', expires_in: 1800, id_token: 'id' };
 
 async function run(db, opts, flow = { intent: 'signin' }) {
-  const { redis, deps } = makeDeps(db, opts);
+  const { redis, deps, calls } = makeDeps(db, opts);
   const { nonce } = await startFlow(redis, { returnApp: 'fastledger', accountId: null, ...flow });
-  return completeFastledgerSignIn(deps, { csrfNonce: nonce, tokenResponse });
+  const result = await completeFastledgerSignIn(deps, { csrfNonce: nonce, tokenResponse });
+  result.connectionsCalls = calls;
+  return result;
 }
 
 test('first sign-in creates the account, the org, one connection, and a session', { skip }, () =>
@@ -115,6 +119,13 @@ test('first sign-in creates the account, the org, one connection, and a session'
     assert.deepEqual(rows.map((x) => [x.role, x.base_currency, x.auto_statements_enabled]), [['owner', 'USD', false], ['owner', 'USD', false]]);
     assert.equal(rows[0].connection_id, rows[1].connection_id, 'one grant, one connection');
     assert.equal((await accounts.getAccount(db, r.accountId)).last_client_id, r.activeClientId);
+  }));
+
+test('every org the login has authorised is used, including ones connected before (no consent-id filter)', { skip }, () =>
+  inTx(async (db) => {
+    const r = await run(db, { orgs: [org('t1', 'Old One'), org('t2', 'Old Two')] });
+    assert.deepEqual(r.connectionsCalls, [['a.b.c']], 'asked with the access token only');
+    assert.equal(r.connected.length, 2);
   }));
 
 test('an unreadable Organisation leaves the base currency empty rather than guessing', { skip }, () =>

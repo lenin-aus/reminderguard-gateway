@@ -42,7 +42,6 @@ function registerDevAuth(app, { pool, redis, xero, tokenManager, accounts, FASTL
           xero: {
             ...xero,
             fetchConnections: async () => orgs,
-            authEventIdFromToken: () => null,
             fetchOrganisation: async () => ({ BaseCurrency: 'AUD' }),
           },
           verifyIdToken: async (_idToken, { nonce: n }) => {
