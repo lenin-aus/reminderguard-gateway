@@ -25,6 +25,7 @@ const { startFlow, redeemConnectTicket } = require('./oauthFlow');
 const accounts = require('./accounts');
 const { verifyXeroIdToken } = require('./oidc');
 const { completeFastledgerSignIn, makeTransaction } = require('./fastledgerAuth');
+const { createAccountHandlers } = require('./accountRoutes');
 
 const app = express();
 app.use(express.json());
@@ -409,23 +410,10 @@ app.post('/oauth/select-org', async (req, res) => {
 });
 
 // ── Self-serve session check — Appsmith's onPageLoad calls this ───────────
-app.get('/session/whoami', resolveSession, async (req, res) => {
-  const connResult = await pool.query(
-    `SELECT c.access_token, c.refresh_token
-     FROM oauth_tokens ot
-     JOIN connections c ON c.id = ot.connection_id
-     WHERE ot.client_id = $1`,
-    [req.client_id]
-  );
-
-  const conn = connResult.rows[0];
-  const reconnectRequired = !conn || conn.access_token === null || conn.refresh_token === null;
-
-  res.json({
-    client_id: req.client_id,
-    status: reconnectRequired ? 'RECONNECT_REQUIRED' : 'active'
-  });
-});
+const accountHandlers = createAccountHandlers({ db: pool, redis, accounts });
+app.get('/session/whoami', resolveSession, accountHandlers.whoami);
+app.post('/accounts/me/connect-ticket', resolveSession, accountHandlers.connectTicket);
+app.put('/accounts/me/last-client', resolveSession, accountHandlers.setLastClient);
 
 // ── Self-serve report trigger — checks completeness, then forwards to n8n ──
 app.post('/trigger/nightly-report/:clientId', async (req, res) => {
