@@ -12,9 +12,9 @@ function sleep(ms) {
 }
 
 // Creates a new connection row and stores its token. Returns connection id.
-async function createConnection(tokenResponse, connectionOwnerType, ownerLabel) {
+async function createConnection(tokenResponse, connectionOwnerType, ownerLabel, db = pool) {
   const expiryTime = new Date(Date.now() + tokenResponse.expires_in * 1000);
-  const { rows } = await pool.query(
+  const { rows } = await db.query(
     `INSERT INTO connections (connection_owner_type, owner_label, access_token, refresh_token, expiry_time, is_refreshing, updated_at)
      VALUES ($1, $2, $3, $4, $5, false, now())
      RETURNING id`,
@@ -24,8 +24,8 @@ async function createConnection(tokenResponse, connectionOwnerType, ownerLabel) 
 }
 
 // Links a client_config row to a connection + specific tenant.
-async function linkClientToConnection(clientId, connectionId, tenantId) {
-  await pool.query(
+async function linkClientToConnection(clientId, connectionId, tenantId, db = pool) {
+  await db.query(
     `INSERT INTO oauth_tokens (client_id, connection_id, xero_tenant_id, updated_at)
      VALUES ($1, $2, $3, now())
      ON CONFLICT (client_id) DO UPDATE SET
@@ -34,6 +34,16 @@ async function linkClientToConnection(clientId, connectionId, tenantId) {
        updated_at = now()`,
     [clientId, connectionId, tenantId]
   );
+}
+
+// A connection nothing points at any more (every org on it was re-pointed to a newer grant, or none
+// was linked) holds a refresh token nobody can use: delete it. Does nothing while any org uses it.
+async function deleteConnectionIfUnused(connectionId, db = pool) {
+  const { rowCount } = await db.query(
+    `DELETE FROM connections WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM oauth_tokens WHERE connection_id = $1)`,
+    [connectionId]
+  );
+  return rowCount > 0;
 }
 
 async function getMapping(clientId) {
@@ -142,4 +152,4 @@ async function getValidToken(clientId) {
   throw err;
 }
 
-module.exports = { createConnection, linkClientToConnection, getMapping, getConnection, getValidToken, saveRefreshedTokens, markConnectionRevoked };
+module.exports = { createConnection, linkClientToConnection, deleteConnectionIfUnused, getMapping, getConnection, getValidToken, saveRefreshedTokens, markConnectionRevoked };

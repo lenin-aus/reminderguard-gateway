@@ -41,3 +41,12 @@ test('the original flow is unchanged: the configured scopes only, and no nonce',
 test('an identity sign-in without a nonce is refused', () => {
   assert.throws(() => buildAuthUrl('s', { identity: true }), { name: 'TypeError' });
 });
+
+test('authEventIdFromToken reads the consent id from the access token claims', () => {
+  const { authEventIdFromToken } = require('./xero');
+  const jwt = (claims) => `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`;
+  assert.equal(authEventIdFromToken(jwt({ authentication_event_id: 'evt-9' })), 'evt-9');
+  assert.equal(authEventIdFromToken(jwt({})), null);
+  assert.equal(authEventIdFromToken('not-a-jwt'), null);
+  assert.equal(authEventIdFromToken(undefined), null);
+});

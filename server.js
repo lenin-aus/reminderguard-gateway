@@ -10,7 +10,7 @@ const xero = require('./xero');
 const tokenManager = require('./tokenManager');
 const { encrypt, decrypt } = require('./crypto');
 const { isConfigComplete } = require('./config');
-const { createSession, resolveSession, startSessionCleanupJob } = require('./session');
+const { createSession, createAccountSession, resolveSession, requireClientAccess, startSessionCleanupJob } = require('./session');
 const { registerHeartbeat } = require('./scheduler');
 const { getOrFetchBaseCurrency, getTenantTodayDateString } = require('./shared');
 const { validateScheduleConfig, toApiConfig, READ_KEYS } = require('./scheduleConfig');
@@ -22,6 +22,9 @@ const { buildCustomerBuckets } = require('./customerBuckets');
 const { lastSentLabel } = require('./lastSent');
 const { requestLog } = require('./requestLog');
 const { startFlow, redeemConnectTicket } = require('./oauthFlow');
+const accounts = require('./accounts');
+const { verifyXeroIdToken } = require('./oidc');
+const { completeFastledgerSignIn, makeTransaction } = require('./fastledgerAuth');
 
 const app = express();
 app.use(express.json());
@@ -166,6 +169,10 @@ app.get('/oauth/callback', async (req, res) => {
     if (mode === 'practice') {
       return res.status(400).send(`<h2>Access denied.</h2><p>Xero returned: ${error}</p>`);
     }
+    // fastledger goes back to its own app; only the self-serve app uses the Appsmith homepage.
+    let deniedApp = null;
+    try { deniedApp = decodeState(state).returnApp; } catch (_) { /* default below */ }
+    if (deniedApp === 'fastledger' && FASTLEDGER_URL) return res.redirect(`${FASTLEDGER_URL}?error=access_denied`);
     return res.redirect(`${SELF_SERVE_HOMEPAGE_URL}?error=access_denied`);
   }
 
@@ -182,6 +189,27 @@ app.get('/oauth/callback', async (req, res) => {
 
   try {
     const tokenResponse = await xero.exchangeCodeForToken(code);
+
+    // fastledger: identity from the id_token, ownership decided per org (see fastledgerAuth.js).
+    if (parsedState.mode === 'self_serve' && parsedState.returnApp === 'fastledger') {
+      const result = await completeFastledgerSignIn(
+        {
+          pool, redis, xero, tokenManager, accounts,
+          verifyIdToken: verifyXeroIdToken,
+          createAccountSession: (accountId) => createAccountSession(accountId),
+          transaction: makeTransaction(pool),
+          senderDefaults: { email: process.env.DEFAULT_SENDER_EMAIL, name: process.env.DEFAULT_SENDER_NAME },
+        },
+        { csrfNonce: parsedState.nonce, tokenResponse }
+      );
+      if (!result.ok) return res.status(result.status).send(result.message);
+      const base = new URL(FASTLEDGER_URL);
+      if (result.sessionToken) base.searchParams.set('token', result.sessionToken);
+      else base.searchParams.set('connected', String(result.connected.length));
+      if (result.skipped.length) base.searchParams.set('skipped', String(result.skipped.length));
+      return res.redirect(base.toString());
+    }
+
     const orgs = await xero.fetchConnections(tokenResponse.access_token);
     if (!orgs.length) return res.status(400).send('No Xero organisation was authorized.');
 
@@ -423,13 +451,10 @@ app.post('/trigger/nightly-report/:clientId', async (req, res) => {
 });
 
 // ── Self-serve Auto Statements trigger — BullMQ, replaces old n8n forwarder ─
-app.post('/trigger/auto-statements/:clientId', requestLog('trigger'), resolveSession, async (req, res) => {
+app.post('/trigger/auto-statements/:clientId', requestLog('trigger'), resolveSession, requireClientAccess, async (req, res) => {
   const { clientId } = req.params;
   const { bucketKeys } = req.body;
 
-  if (String(req.client_id) !== String(clientId)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
   if (!Array.isArray(bucketKeys) || bucketKeys.length === 0) {
     return res.status(400).json({ error: "Invalid payload. 'bucketKeys' array is required." });
   }
@@ -560,12 +585,9 @@ app.post('/trigger/auto-statements/:clientId', requestLog('trigger'), resolveSes
 // Requires a session and only serves the session's own client, like every other
 // /clients/:clientId route. Without this, anyone who could guess a client id could
 // read (and, with POST/PUT/DELETE, modify) that client's Xero organisation.
-app.all('/proxy/xero/:clientId/*', resolveSession, async (req, res) => {
+app.all('/proxy/xero/:clientId/*', resolveSession, requireClientAccess, async (req, res) => {
   const correlationId = req.headers['x-correlation-id'] || crypto.randomUUID();
   const { clientId } = req.params;
-  if (String(req.client_id) !== String(clientId)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
   const xeroPath = req.params[0];
   let queryString = req.url.split('?')[1] || '';
   if (req.query.token !== undefined) {
@@ -631,12 +653,9 @@ async function loadCustomerSource(clientId, { useCache }) {
 }
 
 // ── Self-serve Auto Statements customer list ──────────────────────────────
-app.get('/clients/:clientId/statements/customers', resolveSession, async (req, res) => {
+app.get('/clients/:clientId/statements/customers', resolveSession, requireClientAccess, async (req, res) => {
   const { clientId } = req.params;
 
-  if (String(req.client_id) !== String(clientId)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
 
   try {
     const baseCurrency = await getOrFetchBaseCurrency(clientId);
@@ -693,12 +712,9 @@ app.get('/clients/:clientId/statements/customers', resolveSession, async (req, r
 });
 
 // ── Sent Items page — bounded audit log ────────────────────────────────────
-app.get('/clients/:clientId/statement-logs', resolveSession, async (req, res) => {
+app.get('/clients/:clientId/statement-logs', resolveSession, requireClientAccess, async (req, res) => {
   const { clientId } = req.params;
 
-  if (String(req.client_id) !== String(clientId)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
 
   try {
     const { rows } = await pool.query(
@@ -735,10 +751,7 @@ function withSender(apiConfig, row) {
   };
 }
 
-app.get('/clients/:clientId/config', resolveSession, async (req, res) => {
-  if (String(req.client_id) !== String(req.params.clientId)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+app.get('/clients/:clientId/config', resolveSession, requireClientAccess, async (req, res) => {
 
   try {
     const { rows } = await pool.query(
@@ -753,10 +766,7 @@ app.get('/clients/:clientId/config', resolveSession, async (req, res) => {
   }
 });
 
-app.put('/clients/:clientId/config', resolveSession, async (req, res) => {
-  if (String(req.client_id) !== String(req.params.clientId)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+app.put('/clients/:clientId/config', resolveSession, requireClientAccess, async (req, res) => {
 
   const result = validateScheduleConfig(req.body);
   if (!result.ok) {

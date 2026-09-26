@@ -77,8 +77,12 @@ async function refreshAccessToken(refreshToken) {
   return data; // includes a NEW refresh_token — old one is now invalid (rotation)
 }
 
-async function fetchConnections(accessToken) {
-  const res = await fetch(CONNECTIONS_URL, {
+// The orgs connected to this Xero user. With authEventId (from the access token) only the orgs
+// ticked in THIS consent come back; without it Xero returns every org the user ever connected to
+// the app, which would quietly re-link orgs they did not choose this time.
+async function fetchConnections(accessToken, authEventId = null) {
+  const url = authEventId ? `${CONNECTIONS_URL}?authEventId=${encodeURIComponent(authEventId)}` : CONNECTIONS_URL;
+  const res = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   const data = await res.json();
@@ -86,4 +90,25 @@ async function fetchConnections(accessToken) {
   return data; // array of { tenantId, tenantName, ... }
 }
 
-module.exports = { buildAuthUrl, withIdentityScopes, IDENTITY_SCOPES, exchangeCodeForToken, refreshAccessToken, fetchConnections };
+// The consent this access token came from. Xero puts it in the access token's claims; the token
+// was received directly from Xero over TLS, so it is read here, not re-verified.
+function authEventIdFromToken(accessToken) {
+  try {
+    const payload = JSON.parse(Buffer.from(String(accessToken).split('.')[1], 'base64url').toString('utf8'));
+    return typeof payload.authentication_event_id === 'string' && payload.authentication_event_id !== '' ? payload.authentication_event_id : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// The org's own record: name, base currency, country, timezone.
+async function fetchOrganisation(accessToken, tenantId) {
+  const res = await fetch('https://api.xero.com/api.xro/2.0/Organisation', {
+    headers: { Authorization: `Bearer ${accessToken}`, 'Xero-tenant-id': tenantId, Accept: 'application/json' },
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(`Xero organisation fetch failed: ${res.status}`);
+  return (data.Organisations || [])[0] || null;
+}
+
+module.exports = { buildAuthUrl, withIdentityScopes, IDENTITY_SCOPES, exchangeCodeForToken, refreshAccessToken, fetchConnections, authEventIdFromToken, fetchOrganisation };
