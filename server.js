@@ -20,6 +20,7 @@ const { validateStatementOptions, statementOptionsHash, statementLockKey, Statem
 const { todayInTimezone } = require('./statementRange');
 const { buildCustomerBuckets } = require('./customerBuckets');
 const { lastSentLabel } = require('./lastSent');
+const { requestLog } = require('./requestLog');
 
 const app = express();
 app.use(express.json());
@@ -402,7 +403,7 @@ app.post('/trigger/nightly-report/:clientId', async (req, res) => {
 });
 
 // ── Self-serve Auto Statements trigger — BullMQ, replaces old n8n forwarder ─
-app.post('/trigger/auto-statements/:clientId', resolveSession, async (req, res) => {
+app.post('/trigger/auto-statements/:clientId', requestLog('trigger'), resolveSession, async (req, res) => {
   const { clientId } = req.params;
   const { bucketKeys } = req.body;
 
