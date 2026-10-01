@@ -9,11 +9,13 @@ const ctx = { clientId: 8, tenantId: 'T1', accessToken: 'tok' };
 
 function response(status, body, headers = {}) {
   const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), String(v)]));
+  const buf = Buffer.isBuffer(body) ? body : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
   return {
     status,
     ok: status >= 200 && status < 300,
     headers: { get: (name) => lower[name.toLowerCase()] ?? null },
-    text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
+    text: async () => buf.toString('utf8'),
+    arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
   };
 }
 
@@ -204,4 +206,28 @@ test('assertBudget fails with a clear reason when queued statements need more ca
 
   await limiter.takePending('T1', 100); // some queued statements finished
   await client.assertBudget(ctx);
+});
+
+test('requestBinary returns the raw bytes, asks for application/pdf by default, and goes through the same limiter', async () => {
+  const pdfBytes = Buffer.from('%PDF-1.4 fake');
+  const { client, requests, limiter } = setup([response(200, pdfBytes)]);
+  const before = await limiter.getDayRemaining('T1');
+
+  const result = await client.requestBinary(ctx, 'Invoices/abc');
+
+  assert.ok(Buffer.isBuffer(result));
+  assert.equal(result.toString(), pdfBytes.toString());
+  assert.equal(requests[0].init.headers.Accept, 'application/pdf');
+  assert.equal(requests[0].init.headers.Authorization, 'Bearer tok');
+  assert.equal(await limiter.getDayRemaining('T1'), before, 'uses the same limiter.acquire as request()');
+});
+
+test('requestBinary maps status codes the same way request() does, and retries a 5xx', async () => {
+  const { client } = setup([response(404, 'Not found')]);
+  await assert.rejects(client.requestBinary(ctx, 'Invoices/missing'), { code: 'XERO_NOT_FOUND' });
+
+  const { client: flaky, sleeps } = setup([response(500, ''), response(200, Buffer.from('ok'))]);
+  const result = await flaky.requestBinary(ctx, 'Invoices/abc');
+  assert.equal(result.toString(), 'ok');
+  assert.equal(sleeps.length, 1);
 });

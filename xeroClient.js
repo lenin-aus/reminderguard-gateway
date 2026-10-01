@@ -45,8 +45,11 @@ function createXeroClient({
 } = {}) {
   if (!limiter) throw new Error('createXeroClient needs a limiter');
 
-  // ctx = { clientId, tenantId, accessToken }; the token is fetched once per job.
-  async function request(ctx, path, { query, headers = {} } = {}) {
+  // The retry/limiter/day-tracking loop shared by request() and requestBinary(): acquires a
+  // lease, calls Xero, retries on a network error, a 429 (honouring Retry-After, except a day
+  // limit) or a 5xx. Returns the final response with its body unread, for the caller to parse
+  // (JSON for request(), raw bytes for requestBinary()) however fits its content type.
+  async function fetchOk(ctx, path, { query, headers = {}, accept = 'application/json' } = {}) {
     const url = buildUrl(path, query);
     let lastError = null;
 
@@ -66,7 +69,7 @@ function createXeroClient({
           headers: {
             Authorization: `Bearer ${ctx.accessToken}`,
             'Xero-tenant-id': ctx.tenantId,
-            Accept: 'application/json',
+            Accept: accept,
             ...headers,
           },
         });
@@ -99,24 +102,44 @@ function createXeroClient({
         continue;
       }
 
-      const text = await res.text();
-      let json = null;
-      try {
-        json = text ? JSON.parse(text) : null;
-      } catch {
-        // handled below for the ok case
-      }
-
-      if (res.status === 401) throw new XeroError('Xero rejected the access token', { code: 'XERO_UNAUTHORIZED', status: 401, body: json });
-      if (res.status === 403) throw new XeroError('Xero denied access (missing scope?)', { code: 'XERO_FORBIDDEN', status: 403, body: json });
-      if (res.status === 404) throw new XeroError('Xero resource not found', { code: 'XERO_NOT_FOUND', status: 404, body: json });
-      if (!res.ok) throw new XeroError(`Xero request failed with ${res.status}`, { code: 'XERO_REQUEST_FAILED', status: res.status, body: json });
-      if (json === null) throw new XeroError('Xero returned a body that is not JSON', { code: 'XERO_BAD_RESPONSE', status: res.status });
-
-      return json;
+      return res;
     }
 
     throw lastError || new XeroError('Xero request failed', { code: 'XERO_REQUEST_FAILED', retryable: true });
+  }
+
+  function statusError(res, body) {
+    if (res.status === 401) return new XeroError('Xero rejected the access token', { code: 'XERO_UNAUTHORIZED', status: 401, body });
+    if (res.status === 403) return new XeroError('Xero denied access (missing scope?)', { code: 'XERO_FORBIDDEN', status: 403, body });
+    if (res.status === 404) return new XeroError('Xero resource not found', { code: 'XERO_NOT_FOUND', status: 404, body });
+    if (!res.ok) return new XeroError(`Xero request failed with ${res.status}`, { code: 'XERO_REQUEST_FAILED', status: res.status, body });
+    return null;
+  }
+
+  // ctx = { clientId, tenantId, accessToken }; the token is fetched once per job.
+  async function request(ctx, path, opts = {}) {
+    const res = await fetchOk(ctx, path, opts);
+    const text = await res.text();
+    let json = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      // handled below for the ok case
+    }
+
+    const err = statusError(res, json);
+    if (err) throw err;
+    if (json === null) throw new XeroError('Xero returned a body that is not JSON', { code: 'XERO_BAD_RESPONSE', status: res.status });
+    return json;
+  }
+
+  // Like request(), for an endpoint whose body is not JSON (a PDF). Goes through the same
+  // limiter and day-quota tracking as every other call, so it is never a way around the budget.
+  async function requestBinary(ctx, path, opts = {}) {
+    const res = await fetchOk(ctx, path, { ...opts, accept: opts.accept || 'application/pdf' });
+    const err = statusError(res, null);
+    if (err) throw err;
+    return Buffer.from(await res.arrayBuffer());
   }
 
   // Fetches every page of a list endpoint. listKey is the property that holds the items
@@ -158,7 +181,7 @@ function createXeroClient({
     }
   }
 
-  return { request, getAllPages, assertBudget, limiter };
+  return { request, requestBinary, getAllPages, assertBudget, limiter };
 }
 
 module.exports = { createXeroClient, XeroError, buildUrl, XERO_API };

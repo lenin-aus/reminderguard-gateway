@@ -19,7 +19,7 @@ test('the real client and data layer run on top of the fixtures', async () => {
 });
 
 test('org-wide lists are complete and contacts report whether they have an email', async () => {
-  assert.equal((await data.listOpenInvoices(ctx)).length, 6);
+  assert.equal((await data.listOpenInvoices(ctx)).length, 7); // includes Receipt Test Co's partially paid invoice
   assert.equal((await data.listOpenCredits(ctx)).length, 3);
   const contacts = await data.getContactsByIds(ctx, [ids.pinnacle, ids.bayside]);
   assert.deepEqual(contacts.map((c) => [c.name, c.email !== '']), [['Pinnacle Management', false], ['Bayside Club', true]]);
@@ -41,4 +41,25 @@ test('an organisation with a contact scope sees only those contacts, others see 
   assert.deepEqual([...scoped].sort(), ['Bayside Club', 'Harbour Freight']);
   assert.ok((await names('dev-tenant-7')).includes('City Limousines'));
   await assert.rejects(data.getContact(ctxFor('dev-tenant-6'), ids.cityLimo), /not found/);
+});
+
+test('Payments: customer receipts only, date-filtered, and Invoices/{id} returns a PDF when asked', async () => {
+  const { createXeroPayments } = require('./xeroPayments');
+  const client = createXeroClient({ limiter: createMemoryLimiter(), fetchImpl: createFixtureFetch(), sleep: async () => {} });
+  const payments = createXeroPayments(client);
+
+  const recent = await payments.getRecentReceiptPayments(ctx, '2020-01-01');
+  assert.deepEqual(
+    recent.map((p) => p.invoiceNumber).sort(),
+    ['FX1006', 'RCT-1', 'RCT-2'],
+    'the bill payment (ACCPAYPAYMENT) is excluded',
+  );
+
+  const none = await payments.getRecentReceiptPayments(ctx, '2099-01-01');
+  assert.deepEqual(none, []);
+
+  const pdf = await payments.getInvoicePdf(ctx, (await data.getOpenInvoices(ctx, ids.receiptTest))[0].id);
+  assert.ok(Buffer.isBuffer(pdf) && pdf.toString().startsWith('%PDF'));
+
+  assert.equal(await payments.getInvoiceAmountDue(ctx, (await data.getOpenInvoices(ctx, ids.receiptTest))[0].id), 15000);
 });

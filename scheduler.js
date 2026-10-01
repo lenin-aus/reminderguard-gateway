@@ -28,7 +28,20 @@ async function registerXeroSyncPlanner(queue) {
   console.log('[xero-sync] Registered planner job (*/5 * * * *)');
 }
 
-module.exports = { registerHeartbeat, registerXeroSyncPlanner };
+// The payment-receipt planner: every five minutes, decides which organisations are due a check
+// (paymentReceiptPlan.js) and enqueues one job per due org onto the 'payment-receipts' queue.
+const PAYMENT_RECEIPT_PLANNER_JOB_ID = 'payment-receipt-planner';
+
+async function registerPaymentReceiptPlanner(queue) {
+  await queue.upsertJobScheduler(
+    PAYMENT_RECEIPT_PLANNER_JOB_ID,
+    { pattern: '*/5 * * * *' },
+    { name: 'plan', data: {}, opts: { removeOnComplete: { count: 5 }, removeOnFail: { count: 20 } } }
+  );
+  console.log('[payment-receipts] Registered planner job (*/5 * * * *)');
+}
+
+module.exports = { registerHeartbeat, registerXeroSyncPlanner, registerPaymentReceiptPlanner };
 
 // const HEARTBEAT_JOB_ID = 'auto-statements-heartbeat';
 

@@ -7,13 +7,22 @@
 const { rawInvoices, rawCreditNotes } = require('./statementFixtures');
 
 const guid = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
-const ids = { cityLimo: '0a4cf37b-a1a8-4753-9ee2-f9207f63a8ff', pinnacle: guid(2), bayside: guid(3), harbour: guid(4) };
+const ids = {
+  cityLimo: '0a4cf37b-a1a8-4753-9ee2-f9207f63a8ff',
+  pinnacle: guid(2),
+  bayside: guid(3),
+  harbour: guid(4),
+  receiptTest: guid(5),
+};
 
 const contacts = [
   { ContactID: ids.cityLimo, Name: 'City Limousines', EmailAddress: 'accounts@citylimousines.example', ContactStatus: 'ACTIVE' },
   { ContactID: ids.pinnacle, Name: 'Pinnacle Management', EmailAddress: '', ContactStatus: 'ACTIVE' },
   { ContactID: ids.bayside, Name: 'Bayside Club', EmailAddress: 'finance@bayside.example', ContactStatus: 'ACTIVE' },
   { ContactID: ids.harbour, Name: 'Harbour Freight', EmailAddress: 'ap@harbourfreight.example', ContactStatus: 'ACTIVE' },
+  // Only used by the payment-receipt fixtures below: isolated from every other contact so its
+  // invoices and payments can never shift a total another test already asserts an exact figure for.
+  { ContactID: ids.receiptTest, Name: 'Receipt Test Co', EmailAddress: 'ap@receipttest.example', ContactStatus: 'ACTIVE' },
 ];
 
 const inv = (n, contactId, name, over) => ({
@@ -45,6 +54,42 @@ const invoices = [
     Payments: [{ PaymentID: guid(201), Date: '/Date(1782259200000+0000)/', Amount: 500, Reference: 'EFT' }],
   }),
   inv(5, ids.harbour, 'Harbour Freight', { DateString: '2026-09-15T00:00:00', DueDateString: '2026-10-15T00:00:00', Total: 900, AmountDue: 900 }),
+  // Pinnacle Management has no email: its payment below is the "skipped, no email" receipt case.
+  // PAID (not AUTHORISED), so it never shows up as still owing in any customer-list total.
+  inv(6, ids.pinnacle, 'Pinnacle Management', {
+    Status: 'PAID', DateString: '2026-08-20T00:00:00', DueDateString: '2026-09-03T00:00:00',
+    Total: 150, AmountPaid: 150, AmountDue: 0,
+  }),
+  // Receipt Test Co exists only for the payment-receipt fixtures: a full payment (PAID, due 0 ->
+  // "paid in full") and a partial one (still AUTHORISED, due > 0 -> "still outstanding").
+  inv(7, ids.receiptTest, 'Receipt Test Co', {
+    InvoiceNumber: 'RCT-1', Status: 'PAID', DateString: '2026-09-20T00:00:00', DueDateString: '2026-10-04T00:00:00',
+    Total: 100, AmountPaid: 100, AmountDue: 0,
+  }),
+  inv(8, ids.receiptTest, 'Receipt Test Co', {
+    InvoiceNumber: 'RCT-2', Status: 'AUTHORISED', DateString: '2026-09-22T00:00:00', DueDateString: '2026-10-06T00:00:00',
+    Total: 200, AmountPaid: 50, AmountDue: 150,
+  }),
+];
+
+// Payments are also their own Xero endpoint (GET /Payments), read by the receipt worker directly
+// (not nested under an invoice). Dates are relative to "now" so they always fall inside the
+// worker's lookback window, whenever the stack happens to run.
+const recentDate = (hoursAgo) => new Date(Date.now() - hoursAgo * 3600000).toISOString().slice(0, 19);
+const pay = (n, invoiceId, invoiceNumber, contactId, contactName, amount, hoursAgo, over = {}) => ({
+  PaymentID: guid(400 + n),
+  Status: 'AUTHORISED',
+  PaymentType: 'ACCRECPAYMENT',
+  Amount: amount,
+  DateString: recentDate(hoursAgo),
+  Invoice: { InvoiceID: invoiceId, InvoiceNumber: invoiceNumber, CurrencyCode: 'AUD', Contact: { ContactID: contactId, Name: contactName } },
+  ...over,
+});
+const payments = [
+  pay(1, guid(106), 'FX1006', ids.pinnacle, 'Pinnacle Management', 150, 3), // -> SKIPPED_NO_EMAIL
+  pay(2, guid(107), 'RCT-1', ids.receiptTest, 'Receipt Test Co', 100, 2), // -> SENT, paid in full
+  pay(3, guid(108), 'RCT-2', ids.receiptTest, 'Receipt Test Co', 50, 1), // -> SENT, still outstanding
+  pay(4, guid(104), 'FX1004', ids.harbour, 'Harbour Freight', 500, 240, { PaymentType: 'ACCPAYPAYMENT' }), // a bill payment: must be ignored
 ];
 
 const creditNotes = rawCreditNotes;
@@ -64,14 +109,18 @@ const TENANT_CONTACTS = {
 };
 const visibleTo = (tenantId, contactId) => !TENANT_CONTACTS[tenantId] || TENANT_CONTACTS[tenantId].includes(contactId);
 
-const ID_FIELD = { Invoices: 'InvoiceID', CreditNotes: 'CreditNoteID', Overpayments: 'OverpaymentID', Prepayments: 'PrepaymentID' };
+const ID_FIELD = { Invoices: 'InvoiceID', CreditNotes: 'CreditNoteID', Overpayments: 'OverpaymentID', Prepayments: 'PrepaymentID', Payments: 'PaymentID' };
 
-const SOURCES = { Invoices: invoices, CreditNotes: creditNotes, Overpayments: overpayments, Prepayments: prepayments };
+const SOURCES = { Invoices: invoices, CreditNotes: creditNotes, Overpayments: overpayments, Prepayments: prepayments, Payments: payments };
 
-// Understands the filters xeroData.js uses: ContactIDs/Statuses on Invoices, and
-// where=Contact.ContactID==Guid("..") [AND Status=="..."] on the credit endpoints.
+// A payment's contact lives at Invoice.Contact, unlike every other fixture source.
+const contactIdOf = (x) => x.Contact?.ContactID || x.Invoice?.Contact?.ContactID;
+
+// Understands the filters xeroData.js and xeroPayments.js use: ContactIDs/Statuses on Invoices,
+// where=Contact.ContactID==Guid("..") [AND Status=="..."] on the credit endpoints, and
+// where=Date >= DateTime(y,m,d) on Payments.
 function filterList(path, query, tenantId) {
-  let items = (SOURCES[path] || []).filter((x) => visibleTo(tenantId, x.Contact?.ContactID));
+  let items = (SOURCES[path] || []).filter((x) => visibleTo(tenantId, contactIdOf(x)));
   const ids = query.get('IDs');
   if (ids) items = items.filter((x) => ids.split(',').includes(x[ID_FIELD[path]]));
   const contactIds = query.get('ContactIDs');
@@ -90,12 +139,23 @@ function filterList(path, query, tenantId) {
     if (contact) items = items.filter((x) => x.Contact?.ContactID === contact[1]);
     const status = /Status=="([A-Z]+)"/.exec(where);
     if (status) items = items.filter((x) => x.Status === status[1]);
+    const since = /Date >= DateTime\((\d+),(\d+),(\d+)\)/.exec(where);
+    if (since) {
+      const cutoff = `${since[1]}-${since[2]}-${since[3]}`;
+      items = items.filter((x) => (x.DateString || '').slice(0, 10) >= cutoff);
+    }
   }
   return items;
 }
 
 function json(status, body) {
   return { status, ok: status >= 200 && status < 300, headers: { get: () => null }, text: async () => JSON.stringify(body) };
+}
+
+// A tiny fake PDF: enough bytes to attach and send, never actually rendered.
+function pdf(label) {
+  const bytes = Buffer.from(`%PDF-1.4 fixture invoice ${label}`);
+  return { status: 200, ok: true, headers: { get: () => null }, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
 }
 
 // A stand-in for fetch(), so the REAL Xero client (paging, retries, limiter) runs on top of it.
@@ -123,6 +183,10 @@ function createFixtureFetch() {
     }
     if (path === 'Organisation') return json(200, { Organisations: [{ BaseCurrency: 'AUD', Name: 'Fixture Organisation', ShortCode: '!fixture' }] });
     const [listName, itemId] = path.split('/');
+    if (listName === 'Invoices' && itemId && String(init.headers?.Accept || '').includes('pdf')) {
+      const found = invoices.find((x) => x.InvoiceID === itemId && visibleTo(tenantId, contactIdOf(x)));
+      return found ? pdf(found.InvoiceNumber) : json(404, { Title: 'Not found' });
+    }
     if (itemId && SOURCES[listName]) {
       const found = SOURCES[listName].find((x) => x[ID_FIELD[listName]] === itemId && visibleTo(tenantId, x.Contact?.ContactID));
       return found ? json(200, { [listName]: [found] }) : json(404, { Title: 'Not found' });

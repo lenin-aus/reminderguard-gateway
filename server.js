@@ -11,9 +11,11 @@ const tokenManager = require('./tokenManager');
 const { encrypt, decrypt } = require('./crypto');
 const { isConfigComplete } = require('./config');
 const { createSession, createAccountSession, resolveSession, requireClientAccess, startSessionCleanupJob } = require('./session');
-const { registerHeartbeat, registerXeroSyncPlanner } = require('./scheduler');
+const { registerHeartbeat, registerXeroSyncPlanner, registerPaymentReceiptPlanner } = require('./scheduler');
 const { getOrFetchBaseCurrency, getTenantTodayDateString } = require('./shared');
 const { validateScheduleConfig, toApiConfig, READ_KEYS } = require('./scheduleConfig');
+const { validateReceiptConfig, toApiReceiptConfig, READ_KEYS: RECEIPT_READ_KEYS } = require('./receiptConfig');
+const { checkClient } = require('./paymentReceiptCheck');
 const { getXeroContext, getXeroTenantId, CALLS_PER_STATEMENT } = require('./xeroContext');
 const { getXeroData, getXeroRedis } = require('./xeroData');
 const { getXeroSource, readSyncStatus } = require('./xeroSource');
@@ -56,6 +58,16 @@ const autoStatementsQueue = new Queue('auto-statements', {
 
 // The Xero sync planner (xeroSyncPlan.js); its worker runs inside scheduledCheckWorker.js.
 const xeroSyncQueue = new Queue('xero-sync-planner', {
+  connection: {
+    host: process.env.REDIS_HOST,
+    port: process.env.REDIS_PORT || 6379,
+    username: process.env.REDIS_USERNAME,
+    password: process.env.REDIS_PASSWORD
+  }
+});
+
+// The payment-receipt planner (paymentReceiptPlan.js); its worker runs inside scheduledCheckWorker.js.
+const paymentReceiptPlannerQueue = new Queue('payment-receipt-planner', {
   connection: {
     host: process.env.REDIS_HOST,
     port: process.env.REDIS_PORT || 6379,
@@ -884,6 +896,79 @@ app.put('/clients/:clientId/config', resolveSession, requireClientAccess, async 
   }
 });
 
+// ── Payment Receipt settings (AR Canvas 4.3) ────────────────────────────
+const RECEIPT_CONFIG_COLUMNS = RECEIPT_READ_KEYS.join(', ');
+
+app.get('/clients/:clientId/receipt-config', resolveSession, requireClientAccess, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT ${RECEIPT_CONFIG_COLUMNS} FROM client_config WHERE id = $1`,
+      [req.client_id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Client not found' });
+    res.json(toApiReceiptConfig(rows[0]));
+  } catch (e) {
+    console.error('Get receipt config error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.put('/clients/:clientId/receipt-config', resolveSession, requireClientAccess, async (req, res) => {
+  const result = validateReceiptConfig(req.body);
+  if (!result.ok) {
+    return res.status(400).json({
+      error: 'Invalid receipt settings',
+      code: 'VALIDATION_FAILED',
+      fields: result.fields,
+    });
+  }
+  const c = result.value;
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE client_config SET
+         receipts_enabled = $1,
+         receipts_schedule_mode = $2,
+         receipts_schedule_time = $3,
+         receipt_test_email = $4,
+         receipt_cc_email = $5,
+         receipt_alert_email = $6
+       WHERE id = $7
+       RETURNING ${RECEIPT_CONFIG_COLUMNS}`,
+      [
+        c.receipts_enabled,
+        c.receipts_schedule_mode,
+        c.receipts_schedule_time,
+        c.receipt_test_email,
+        c.receipt_cc_email,
+        c.receipt_alert_email,
+        req.client_id,
+      ]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Client not found' });
+    res.json(toApiReceiptConfig(rows[0]));
+  } catch (e) {
+    console.error('Update receipt config error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Runs a payment-receipt check for this org right now, instead of waiting for the planner's next
+// tick (at most 5 minutes). The same work the planner would eventually queue; no new Xero scopes,
+// no new email path. Does nothing (200, checked: false) when receipts are not enabled.
+app.post('/clients/:clientId/receipts-check', resolveSession, requireClientAccess, async (req, res) => {
+  try {
+    const result = await checkClient(req.client_id);
+    res.json(result);
+  } catch (e) {
+    console.error('Payment receipt check error:', e);
+    if (e.code === 'XERO_DAILY_LIMIT') return res.status(429).json({ error: e.message, code: e.code });
+    if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
+    if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
+    res.status(502).json({ error: e.message, code: e.code || 'GATEWAY_ERROR' });
+  }
+});
+
 // ── Xero disconnect webhook ─────────────────────────────────────────────
 app.post('/webhooks/xero', express.raw({ type: '*/*' }), async (req, res) => {
   console.log('Received Xero webhook (signature validation not yet implemented)');
@@ -896,6 +981,9 @@ registerHeartbeat(schedulerQueue).catch((e) =>
 );
 registerXeroSyncPlanner(xeroSyncQueue).catch((e) =>
   console.error('[xero-sync] Failed to register planner job at boot:', e.message)
+);
+registerPaymentReceiptPlanner(paymentReceiptPlannerQueue).catch((e) =>
+  console.error('[payment-receipts] Failed to register planner job at boot:', e.message)
 );
 
 const PORT = process.env.PORT || 4000;
