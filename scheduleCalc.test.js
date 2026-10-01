@@ -4,7 +4,7 @@
 // Exits 0 if every case passes, 1 if any case fails.
 
 const { DateTime } = require('luxon');
-const { computeFirstRun, computeNextRun } = require('./scheduleCalc');
+const { computeFirstRun, computeNextRun, computeUpcomingRuns } = require('./scheduleCalc');
 
 const ZONE = 'Australia/Melbourne';
 let passed = 0;
@@ -276,6 +276,37 @@ firstRun(
   '2027-04-01T09:00',
   'Mon 05 Apr 2027 06:00 +10:00'
 );
+
+// computeUpcomingRuns: the "Next runs" list.
+{
+  const config = cfg({ schedule_day: 'day', schedule_ordinal: 'the 1st' });
+  const from = DateTime.fromISO('2026-09-15T09:00', { zone: ZONE }).toJSDate();
+  const runs = computeUpcomingRuns(config, { from, count: 4 }).map((d) => fmt(d));
+  check('computeUpcomingRuns: monthly on the 1st, 4 in a row, each a month apart', runs.join(' | '), [
+    'Thu 01 Oct 2026 06:00 +10:00',
+    'Sun 01 Nov 2026 06:00 +11:00', // crosses spring forward
+    'Tue 01 Dec 2026 06:00 +11:00',
+    'Fri 01 Jan 2027 06:00 +11:00',
+  ].join(' | '));
+}
+{
+  // When next_run_at is already stored (the normal case: the heartbeat backfilled it), that exact
+  // value is the first one — never recomputed — so the list matches what will actually fire.
+  const stored = DateTime.fromISO('2026-10-20T06:00', { zone: ZONE }).toUTC().toISO();
+  const config = cfg({ schedule_day: 'day', schedule_ordinal: 'the 20th', next_run_at: stored });
+  const runs = computeUpcomingRuns(config, { count: 2 }).map((d) => fmt(d));
+  check('computeUpcomingRuns: the first entry is the stored next_run_at, not recomputed', runs[0], 'Tue 20 Oct 2026 06:00 +11:00');
+}
+{
+  const config = cfg({ schedule_unit: 'week', schedule_day: 'Monday', schedule_ordinal: null });
+  const from = DateTime.fromISO('2026-09-15T09:00', { zone: ZONE }).toJSDate(); // a Tuesday
+  const runs = computeUpcomingRuns(config, { from, count: 3 }).map((d) => fmt(d));
+  check('computeUpcomingRuns: weekly, one week apart', runs.join(' | '), [
+    'Mon 21 Sep 2026 06:00 +10:00',
+    'Mon 28 Sep 2026 06:00 +10:00',
+    'Mon 05 Oct 2026 06:00 +11:00',
+  ].join(' | '));
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

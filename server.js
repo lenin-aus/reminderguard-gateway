@@ -14,8 +14,10 @@ const { createSession, createAccountSession, resolveSession, requireClientAccess
 const { registerHeartbeat, registerXeroSyncPlanner, registerPaymentReceiptPlanner } = require('./scheduler');
 const { getOrFetchBaseCurrency, getTenantTodayDateString } = require('./shared');
 const { validateScheduleConfig, toApiConfig, READ_KEYS } = require('./scheduleConfig');
+const { computeUpcomingRuns } = require('./scheduleCalc');
 const { validateReceiptConfig, toApiReceiptConfig, READ_KEYS: RECEIPT_READ_KEYS } = require('./receiptConfig');
 const { checkClient } = require('./paymentReceiptCheck');
+const { acquireReceiptLock, computeUpcomingReceiptRuns } = require('./paymentReceiptPlan');
 const { getXeroContext, getXeroTenantId, CALLS_PER_STATEMENT } = require('./xeroContext');
 const { getXeroData, getXeroRedis } = require('./xeroData');
 const { getXeroSource, readSyncStatus } = require('./xeroSource');
@@ -819,15 +821,31 @@ function withSender(apiConfig, row) {
   };
 }
 
+// The "Next runs" list: always shown when there is a real (enabled) schedule, never stored — only
+// next_run_at itself is persisted, left NULL after a schedule change for the heartbeat to backfill
+// (so the UI must never expect an immediate STORED value — see CLAUDE.md). This computes the same
+// thing on demand with the exact function the heartbeat uses, so it always agrees with what will
+// actually fire; it is just not written early. A row that is enabled but, from stale data predating
+// the save-time safety net, cannot be computed falls back to an empty list rather than a 500.
+function withNextRuns(apiConfig, row) {
+  if (!row.auto_statements_enabled) return { ...apiConfig, next_runs: [] };
+  try {
+    return { ...apiConfig, next_runs: computeUpcomingRuns(row).map((d) => d.toISOString()) };
+  } catch (e) {
+    console.error(`next_runs: client ${row.id} could not be computed:`, e.message);
+    return { ...apiConfig, next_runs: [] };
+  }
+}
+
 app.get('/clients/:clientId/config', resolveSession, requireClientAccess, async (req, res) => {
 
   try {
     const { rows } = await pool.query(
-      `SELECT ${CONFIG_COLUMNS}, next_run_at, client_name, sender_email, sender_name FROM client_config WHERE id = $1`,
+      `SELECT id, ${CONFIG_COLUMNS}, next_run_at, client_name, sender_email, sender_name FROM client_config WHERE id = $1`,
       [req.client_id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Client not found' });
-    res.json(withSender(toApiConfig(rows[0]), rows[0]));
+    res.json(withNextRuns(withSender(toApiConfig(rows[0]), rows[0]), rows[0]));
   } catch (e) {
     console.error('Get client config error:', e);
     res.status(500).json({ error: 'Server error' });
@@ -872,7 +890,7 @@ app.put('/clients/:clientId/config', resolveSession, requireClientAccess, async 
            ELSE next_run_at
          END
        WHERE id = $12
-       RETURNING ${CONFIG_COLUMNS}, next_run_at, client_name, sender_email, sender_name`,
+       RETURNING id, ${CONFIG_COLUMNS}, next_run_at, client_name, sender_email, sender_name`,
       [
         c.auto_statements_enabled,
         c.schedule_unit,
@@ -889,7 +907,7 @@ app.put('/clients/:clientId/config', resolveSession, requireClientAccess, async 
       ]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Client not found' });
-    res.json(withSender(toApiConfig(rows[0]), rows[0]));
+    res.json(withNextRuns(withSender(toApiConfig(rows[0]), rows[0]), rows[0]));
   } catch (e) {
     console.error('Update client config error:', e);
     res.status(500).json({ error: 'Server error' });
@@ -899,14 +917,41 @@ app.put('/clients/:clientId/config', resolveSession, requireClientAccess, async 
 // ── Payment Receipt settings (AR Canvas 4.3) ────────────────────────────
 const RECEIPT_CONFIG_COLUMNS = RECEIPT_READ_KEYS.join(', ');
 
+// The "Next runs" list, computed fresh every read — there is nothing to persist early here (unlike
+// Auto Statements' next_run_at, there is no stored "next run" for receipts at all; the planner only
+// ever asks "has enough time passed"). Needs last_checked_at (payment_receipt_state) and the
+// timezone, so the caller's query must select them alongside the receipt columns.
+function withReceiptNextRuns(apiConfig, row) {
+  if (!row.receipts_enabled || !row.receipts_schedule_mode) return { ...apiConfig, next_runs: [] };
+  try {
+    const client = {
+      mode: row.receipts_schedule_mode,
+      time: row.receipts_schedule_time,
+      tz: row.schedule_timezone || 'Australia/Melbourne',
+      last_checked_at: row.last_checked_at,
+    };
+    return { ...apiConfig, next_runs: computeUpcomingReceiptRuns(client).map((d) => d.toISOString()) };
+  } catch (e) {
+    console.error(`receipt next_runs: client ${row.id} could not be computed:`, e.message);
+    return { ...apiConfig, next_runs: [] };
+  }
+}
+
+// cc.id first, then the writable receipt columns (unqualified names match, since client_config is
+// the only table with them), then the two extra fields withReceiptNextRuns needs.
+const RECEIPT_CONFIG_SELECT = `cc.id, ${RECEIPT_CONFIG_COLUMNS}, cc.schedule_timezone, prs.last_checked_at`;
+
 app.get('/clients/:clientId/receipt-config', resolveSession, requireClientAccess, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT ${RECEIPT_CONFIG_COLUMNS} FROM client_config WHERE id = $1`,
+      `SELECT ${RECEIPT_CONFIG_SELECT}
+         FROM client_config cc
+         LEFT JOIN payment_receipt_state prs ON prs.client_id = cc.id
+        WHERE cc.id = $1`,
       [req.client_id]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Client not found' });
-    res.json(toApiReceiptConfig(rows[0]));
+    res.json(withReceiptNextRuns(toApiReceiptConfig(rows[0]), rows[0]));
   } catch (e) {
     console.error('Get receipt config error:', e);
     res.status(500).json({ error: 'Server error' });
@@ -934,7 +979,7 @@ app.put('/clients/:clientId/receipt-config', resolveSession, requireClientAccess
          receipt_cc_email = $5,
          receipt_alert_email = $6
        WHERE id = $7
-       RETURNING ${RECEIPT_CONFIG_COLUMNS}`,
+       RETURNING id, ${RECEIPT_CONFIG_COLUMNS}, schedule_timezone`,
       [
         c.receipts_enabled,
         c.receipts_schedule_mode,
@@ -946,7 +991,12 @@ app.put('/clients/:clientId/receipt-config', resolveSession, requireClientAccess
       ]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Client not found' });
-    res.json(toApiReceiptConfig(rows[0]));
+    // A schedule change never resets last_checked_at (unlike Auto Statements' next_run_at, there is
+    // nothing stored to reset) — the planner just uses the new mode from here on, so the next run is
+    // computed straight from whatever the state table already has.
+    const { rows: stateRows } = await pool.query('SELECT last_checked_at FROM payment_receipt_state WHERE client_id = $1', [req.client_id]);
+    const row = { ...rows[0], last_checked_at: stateRows[0]?.last_checked_at ?? null };
+    res.json(withReceiptNextRuns(toApiReceiptConfig(row), row));
   } catch (e) {
     console.error('Update receipt config error:', e);
     res.status(500).json({ error: 'Server error' });
@@ -957,7 +1007,10 @@ app.put('/clients/:clientId/receipt-config', resolveSession, requireClientAccess
 // tick (at most 5 minutes). The same work the planner would eventually queue; no new Xero scopes,
 // no new email path. Does nothing (200, checked: false) when receipts are not enabled.
 app.post('/clients/:clientId/receipts-check', resolveSession, requireClientAccess, async (req, res) => {
+  let release = null;
   try {
+    release = await acquireReceiptLock(redis, req.client_id);
+    if (!release) return res.status(409).json({ error: 'A receipt check is already running for this organisation.', code: 'CHECK_IN_PROGRESS' });
     const result = await checkClient(req.client_id);
     res.json(result);
   } catch (e) {
@@ -966,6 +1019,8 @@ app.post('/clients/:clientId/receipts-check', resolveSession, requireClientAcces
     if (e.code === 'RECONNECT_REQUIRED') return res.status(401).json({ error: e.message, code: e.code });
     if (e.code === 'NOT_CONNECTED') return res.status(409).json({ error: e.message, code: e.code });
     res.status(502).json({ error: e.message, code: e.code || 'GATEWAY_ERROR' });
+  } finally {
+    if (release) await release().catch(() => {});
   }
 });
 

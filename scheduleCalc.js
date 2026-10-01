@@ -209,4 +209,27 @@ function computeNextRun(config, fromDate) {
   return candidate.toUTC().toJSDate();
 }
 
-module.exports = { computeFirstRun, computeNextRun, normalizeConfig, ordinalWeekdayOfMonth, dayOfMonthSlot, monthSlot };
+// Several future occurrences, for display (the Schedule Settings "Next runs" list). The first one
+// is config.next_run_at if it is already stored (the same value the heartbeat will actually use),
+// else it is computed fresh as computeFirstRun would; each later one calls computeNextRun on the
+// one before it. Call only for an enabled, complete schedule — the same safety net that already
+// guards a save (scheduleConfig.js) means this never throws for a row that passed validation.
+function computeUpcomingRuns(config, { from = new Date(), count = 4 } = {}) {
+  let next = config.next_run_at ? new Date(config.next_run_at) : computeFirstRun(config, from);
+  const runs = [next];
+  while (runs.length < count) {
+    next = computeNextRun(config, next);
+    runs.push(next);
+  }
+  return runs;
+}
+
+module.exports = {
+  computeFirstRun,
+  computeNextRun,
+  computeUpcomingRuns,
+  normalizeConfig,
+  ordinalWeekdayOfMonth,
+  dayOfMonthSlot,
+  monthSlot,
+};

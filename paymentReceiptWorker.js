@@ -11,7 +11,9 @@
 
 const { Worker } = require('bullmq');
 const pool = require('./db');
+const { getXeroRedis } = require('./xeroData');
 const { checkClient } = require('./paymentReceiptCheck');
+const { acquireReceiptLock } = require('./paymentReceiptPlan');
 
 const connection = {
   host: process.env.REDIS_HOST,
@@ -24,6 +26,11 @@ const worker = new Worker(
   'payment-receipts',
   async (job) => {
     const { clientId } = job.data;
+    // One check per org at a time (see paymentReceiptPlan.js's comment on the jobId bug this
+    // replaced). A lock already held just means a check is already running — not an error, and not
+    // something to log every tick: this job simply has nothing to do.
+    const release = await acquireReceiptLock(getXeroRedis(), clientId);
+    if (!release) return;
     try {
       await checkClient(clientId);
     } catch (e) {
@@ -35,6 +42,8 @@ const worker = new Worker(
         [clientId, String(e.message).slice(0, 500)]
       );
       throw e;
+    } finally {
+      await release().catch(() => {});
     }
   },
   { connection, concurrency: 2 }
