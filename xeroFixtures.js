@@ -159,14 +159,26 @@ function pdf(label) {
 }
 
 // A stand-in for fetch(), so the REAL Xero client (paging, retries, limiter) runs on top of it.
-// It pages lists 100 at a time like Xero does, and answers only GETs on api.xro/2.0.
+// It pages lists 100 at a time like Xero does, and answers only GETs on api.xro/2.0 — except the
+// one write Action Queue needs (Approve & Send setting an invoice's ExpectedPaymentDate), added so
+// that whole flow can be proven on the local stack before it is ever run for real.
 function createFixtureFetch() {
   return async (url, init = {}) => {
-    if ((init.method || 'GET') !== 'GET') return json(405, { error: 'Fixtures answer GET only' });
     const u = new URL(url);
     const path = u.pathname.replace('/api.xro/2.0/', '');
     const query = u.searchParams;
     const tenantId = init.headers?.['Xero-tenant-id'];
+
+    if ((init.method || 'GET') === 'POST' && path.startsWith('Invoices/')) {
+      const id = path.slice('Invoices/'.length);
+      const found = invoices.find((x) => x.InvoiceID === id && visibleTo(tenantId, contactIdOf(x)));
+      if (!found) return json(404, { Title: 'Not found' });
+      const body = JSON.parse(init.body || '{}');
+      const patch = body.Invoices?.[0] || {};
+      if (patch.ExpectedPaymentDate) found.ExpectedPaymentDate = `${patch.ExpectedPaymentDate}T00:00:00`;
+      return json(200, { Invoices: [found] });
+    }
+    if ((init.method || 'GET') !== 'GET') return json(405, { error: 'Fixtures answer GET only' });
 
     if (path.startsWith('Contacts/')) {
       const id = path.slice('Contacts/'.length);

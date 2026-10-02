@@ -210,6 +210,19 @@ function createXeroData(client) {
       return found;
     },
 
+    // Action Queue (Approve & Send): sets ExpectedPaymentDate on one invoice, from an Action Queue
+    // approval, never from an automated worker. A write, not a read — goes through the same
+    // limiter/day-quota/retry machinery (xeroClient.request with method/body), but callers should
+    // treat failures as needing a human look, not a silent retry, given the blast radius of writing
+    // the wrong date to a client's live accounting record.
+    async updateInvoiceExpectedPaymentDate(ctx, invoiceId, dateIso) {
+      const data = await client.request(ctx, `Invoices/${assertGuid(invoiceId)}`, {
+        method: 'POST',
+        body: { Invoices: [{ InvoiceID: invoiceId, ExpectedPaymentDate: dateIso }] },
+      });
+      return (data.Invoices || [])[0] || null;
+    },
+
     // Daily-quota bookkeeping shared with the Xero client's limiter (see xeroClient.assertBudget).
     assertBudget: (ctx, extraCalls = 0) => client.assertBudget(ctx, extraCalls),
     dayRemaining: (tenantId) => client.limiter.getDayRemaining(tenantId),

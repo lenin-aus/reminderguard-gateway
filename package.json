@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "bullmq": "^6.0.8",
+    "chrono-node": "^2.10.1",
     "cookie-parser": "^1.4.6",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

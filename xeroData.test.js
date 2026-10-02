@@ -138,6 +138,16 @@ test('getContact trims the email and reports an archived contact', async () => {
   assert.equal(await createXeroData(fakeClient({}, { Contacts: [] })).getContact(CTX, CONTACT), null);
 });
 
+test('updateInvoiceExpectedPaymentDate POSTs the date to the one invoice and returns the updated row', async () => {
+  const invoiceId = '1a4cf37b-a1a8-4753-9ee2-f9207f63a8ff';
+  const client = fakeClient({}, { Invoices: [{ InvoiceID: invoiceId, ExpectedPaymentDate: '2026-10-16T00:00:00' }] });
+  const result = await createXeroData(client).updateInvoiceExpectedPaymentDate(CTX, invoiceId, '2026-10-16');
+  assert.equal(client.calls[0].path, `Invoices/${invoiceId}`);
+  assert.equal(client.calls[0].opts.method, 'POST');
+  assert.deepEqual(client.calls[0].opts.body, { Invoices: [{ InvoiceID: invoiceId, ExpectedPaymentDate: '2026-10-16' }] });
+  assert.equal(result.ExpectedPaymentDate, '2026-10-16T00:00:00');
+});
+
 test('listOpenCredits keeps only credits that still have a balance', async () => {
   const client = fakeClient({
     CreditNotes: [

@@ -49,7 +49,7 @@ function createXeroClient({
   // lease, calls Xero, retries on a network error, a 429 (honouring Retry-After, except a day
   // limit) or a 5xx. Returns the final response with its body unread, for the caller to parse
   // (JSON for request(), raw bytes for requestBinary()) however fits its content type.
-  async function fetchOk(ctx, path, { query, headers = {}, accept = 'application/json' } = {}) {
+  async function fetchOk(ctx, path, { query, headers = {}, accept = 'application/json', method = 'GET', body } = {}) {
     const url = buildUrl(path, query);
     let lastError = null;
 
@@ -65,13 +65,15 @@ function createXeroClient({
       let res;
       try {
         res = await fetchImpl(url, {
-          method: 'GET',
+          method,
           headers: {
             Authorization: `Bearer ${ctx.accessToken}`,
             'Xero-tenant-id': ctx.tenantId,
             Accept: accept,
+            ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
             ...headers,
           },
+          ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         });
       } catch (err) {
         lastError = new XeroError(`Xero request failed: ${err.message}`, { code: 'XERO_NETWORK', retryable: true });
@@ -116,7 +118,10 @@ function createXeroClient({
     return null;
   }
 
-  // ctx = { clientId, tenantId, accessToken }; the token is fetched once per job.
+  // ctx = { clientId, tenantId, accessToken }; the token is fetched once per job. method/body let a
+  // caller POST or PUT (e.g. updating an Invoice's ExpectedPaymentDate) through the same
+  // limiter/retry/day-quota machinery as every read; opts without method/body behaves exactly as
+  // before, so this is additive and every existing read call site is unaffected.
   async function request(ctx, path, opts = {}) {
     const res = await fetchOk(ctx, path, opts);
     const text = await res.text();

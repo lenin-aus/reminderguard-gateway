@@ -29,9 +29,23 @@ test('an unknown contact is a Xero 404, like the real API', async () => {
   await assert.rejects(data.getContact(ctx, '99999999-9999-4999-8999-999999999999'), (err) => err instanceof XeroError && err.code === 'XERO_NOT_FOUND');
 });
 
-test('fixtures refuse anything but GET', async () => {
+test('fixtures refuse a write except the one Action Queue needs', async () => {
   const res = await createFixtureFetch()('https://api.xero.com/api.xro/2.0/Invoices', { method: 'POST' });
   assert.equal(res.status, 405);
+});
+
+test('updateInvoiceExpectedPaymentDate writes through the fixture', async () => {
+  const history = await data.getInvoiceHistory(ctx, ids.harbour);
+  const invoiceId = history.find((i) => i.status === 'AUTHORISED').id;
+  const updated = await data.updateInvoiceExpectedPaymentDate(ctx, invoiceId, '2026-10-16');
+  assert.equal(updated.ExpectedPaymentDate, '2026-10-16T00:00:00');
+});
+
+test('an unknown invoice id is a 404 for the write too', async () => {
+  await assert.rejects(
+    data.updateInvoiceExpectedPaymentDate(ctx, '99999999-9999-4999-8999-999999999999', '2026-10-16'),
+    (err) => err instanceof XeroError && err.code === 'XERO_NOT_FOUND'
+  );
 });
 
 test('an organisation with a contact scope sees only those contacts, others see everything', async () => {

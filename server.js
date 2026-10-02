@@ -20,6 +20,7 @@ const { checkClient } = require('./paymentReceiptCheck');
 const { acquireReceiptLock, computeUpcomingReceiptRuns } = require('./paymentReceiptPlan');
 const { getXeroContext, getXeroTenantId, CALLS_PER_STATEMENT } = require('./xeroContext');
 const { getXeroData, getXeroRedis } = require('./xeroData');
+const { parseReplyToken, parseBucketKey, classifyReply, resumeAfterFor } = require('./inboundReply');
 const { getXeroSource, readSyncStatus } = require('./xeroSource');
 const { diffCustomers, formatShadowLog } = require('./xeroShadow');
 const { acquireSyncLock } = require('./xeroSyncPlan');
@@ -922,18 +923,16 @@ const RECEIPT_CONFIG_COLUMNS = RECEIPT_READ_KEYS.join(', ');
 // ever asks "has enough time passed"). Needs last_checked_at (payment_receipt_state) and the
 // timezone, so the caller's query must select them alongside the receipt columns.
 function withReceiptNextRuns(apiConfig, row) {
-  if (!row.receipts_enabled || !row.receipts_schedule_mode) return { ...apiConfig, next_runs: [] };
+  // Read-only, same as Auto Statements' own schedule_timezone: the frontend needs it to format
+  // next_runs in the org's zone, but never sends it back (not in receiptConfig.js's WRITABLE_KEYS).
+  const tz = row.schedule_timezone || 'Australia/Melbourne';
+  if (!row.receipts_enabled || !row.receipts_schedule_mode) return { ...apiConfig, next_runs: [], schedule_timezone: tz };
   try {
-    const client = {
-      mode: row.receipts_schedule_mode,
-      time: row.receipts_schedule_time,
-      tz: row.schedule_timezone || 'Australia/Melbourne',
-      last_checked_at: row.last_checked_at,
-    };
-    return { ...apiConfig, next_runs: computeUpcomingReceiptRuns(client).map((d) => d.toISOString()) };
+    const client = { mode: row.receipts_schedule_mode, time: row.receipts_schedule_time, tz, last_checked_at: row.last_checked_at };
+    return { ...apiConfig, next_runs: computeUpcomingReceiptRuns(client).map((d) => d.toISOString()), schedule_timezone: tz };
   } catch (e) {
     console.error(`receipt next_runs: client ${row.id} could not be computed:`, e.message);
-    return { ...apiConfig, next_runs: [] };
+    return { ...apiConfig, next_runs: [], schedule_timezone: tz };
   }
 }
 
@@ -1021,6 +1020,224 @@ app.post('/clients/:clientId/receipts-check', resolveSession, requireClientAcces
     res.status(502).json({ error: e.message, code: e.code || 'GATEWAY_ERROR' });
   } finally {
     if (release) await release().catch(() => {});
+  }
+});
+
+// ── Action Queue (Parse & Pause) ────────────────────────────────────────
+// A debtor's reply to a statement pauses chasing on that contact+currency bucket instantly, then
+// gets classified (regex/chrono-node first, an LLM fallback for anything ambiguous — see
+// inboundReply.js) into a card on the bookkeeper's Action Queue. Nothing sends, and nothing writes
+// to Xero, until the bookkeeper approves. See migrations/006_action_queue.sql.
+
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const BREVO_API_URL = process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email';
+const INBOUND_WEBHOOK_SECRET = process.env.INBOUND_WEBHOOK_SECRET;
+
+async function sendThreadedReply({ senderEmail, senderName, toEmail, subject, bodyText, inReplyTo }) {
+  const htmlContent = `<p>${String(bodyText).split('\n').map((l) => l || '&nbsp;').join('</p><p>')}</p>`;
+  const res = await fetch(BREVO_API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'api-key': BREVO_API_KEY },
+    body: JSON.stringify({
+      sender: { email: senderEmail, name: senderName },
+      to: [{ email: toEmail }],
+      subject,
+      htmlContent,
+      ...(inReplyTo ? { headers: { 'In-Reply-To': inReplyTo, References: inReplyTo } } : {}),
+    }),
+  });
+  if (!res.ok) throw new Error(`Brevo send failed: ${res.status} - ${await res.text()}`);
+  const body = await res.json().catch(() => null);
+  return body?.messageId || null;
+}
+
+// Brevo's inbound webhook carries no signature to verify (checked against their docs 2026-10-02),
+// so the URL itself carries an unguessable secret as a second factor alongside the ownership check
+// below. A wrong or missing secret gets a plain 404, not a 401/403, so as not to confirm the path
+// shape to a scanner.
+app.post('/webhooks/inbound-reply/:secret', async (req, res) => {
+  if (!INBOUND_WEBHOOK_SECRET || req.params.secret !== INBOUND_WEBHOOK_SECRET) return res.sendStatus(404);
+
+  try {
+    const toCandidates = Array.isArray(req.body?.To) ? req.body.To : [req.body?.To].filter(Boolean);
+    let token = null;
+    for (const to of toCandidates) {
+      token = parseReplyToken(to?.Address || to);
+      if (token) break;
+    }
+    if (!token) {
+      console.warn('[inbound-reply] no chase+ token found in To, dropping', JSON.stringify(toCandidates));
+      return res.sendStatus(200);
+    }
+    const { clientId, bucketKey } = token;
+
+    const clientRow = await pool.query('SELECT id FROM client_config WHERE id = $1', [clientId]);
+    if (clientRow.rows.length === 0) {
+      console.warn(`[inbound-reply] token names client ${clientId}, which does not exist — dropping`);
+      return res.sendStatus(200);
+    }
+
+    const messageId = req.body?.MessageId || req.body?.Headers?.['Message-Id'] || `missing-${Date.now()}-${Math.random()}`;
+
+    // Ghost protection: locked before classification, which can take a few seconds (the LLM
+    // fallback). A webhook retry (same MessageId) is harmless here — it just re-pends the review.
+    await pool.query(
+      `INSERT INTO chase_pause (client_id, bucket_key, status, resume_after)
+       VALUES ($1, $2, 'PAUSED_PENDING_REVIEW', NULL)
+       ON CONFLICT (client_id, bucket_key)
+       DO UPDATE SET status = 'PAUSED_PENDING_REVIEW', resume_after = NULL, updated_at = now()`,
+      [clientId, bucketKey]
+    );
+
+    const threadRow = await pool.query(
+      `SELECT sent_message_id FROM statement_logs
+        WHERE client_id = $1 AND bucket_key = $2 AND sent_message_id IS NOT NULL
+        ORDER BY created_at DESC LIMIT 1`,
+      [clientId, bucketKey]
+    );
+    const inReplyTo = threadRow.rows[0]?.sent_message_id || req.body?.InReplyTo || null;
+
+    const bodyText = req.body?.ExtractedMarkdownMessage || '';
+    const classification = await classifyReply(bodyText);
+    const proposedResumeAfter = resumeAfterFor(classification.targetDate);
+
+    await pool.query(
+      `INSERT INTO inbound_reply
+         (client_id, bucket_key, contact_name, from_email, subject, body_text, message_id, in_reply_to,
+          source, intent, confidence, target_date, draft_reply, proposed_resume_after)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+       ON CONFLICT (client_id, message_id) DO NOTHING`,
+      [
+        clientId, bucketKey, req.body?.From?.Name || '', req.body?.From?.Address || '',
+        req.body?.Subject || '', bodyText, messageId, inReplyTo,
+        classification.source, classification.intent, classification.confidence,
+        classification.targetDate, classification.draftReply, proposedResumeAfter,
+      ]
+    );
+
+    res.sendStatus(200);
+  } catch (e) {
+    console.error('[inbound-reply] webhook failed:', e);
+    // Still 200: the bucket is already paused (the insert above runs first), and Brevo would
+    // otherwise retry an email that may have partially succeeded.
+    res.sendStatus(200);
+  }
+});
+
+app.get('/action-queue', resolveSession, async (req, res) => {
+  if (!req.account_id) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const { rows } = await pool.query(
+      `SELECT ir.id, ir.client_id, cc.client_name, ir.bucket_key, ir.contact_name, ir.from_email,
+              ir.subject, ir.body_text, ir.in_reply_to, ir.source, ir.intent, ir.confidence,
+              to_char(ir.target_date, 'YYYY-MM-DD') AS target_date,
+              ir.draft_reply, ir.proposed_resume_after, ir.created_at
+         FROM inbound_reply ir
+         JOIN account_clients ac ON ac.client_id = ir.client_id
+         JOIN client_config cc ON cc.id = ir.client_id
+        WHERE ac.account_id = $1 AND ir.status = 'PENDING_REVIEW'
+        ORDER BY ir.created_at DESC`,
+      [req.account_id]
+    );
+    res.json({ items: rows });
+  } catch (e) {
+    console.error('Action Queue list error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+async function loadOwnedPendingReply(id, accountId) {
+  const { rows } = await pool.query(
+    `SELECT ir.*, cc.sender_email, cc.sender_name, cc.client_name
+       FROM inbound_reply ir
+       JOIN account_clients ac ON ac.client_id = ir.client_id
+       JOIN client_config cc ON cc.id = ir.client_id
+      WHERE ir.id = $1 AND ac.account_id = $2 AND ir.status = 'PENDING_REVIEW'`,
+    [id, accountId]
+  );
+  return rows[0] || null;
+}
+
+app.post('/action-queue/:id/approve', resolveSession, async (req, res) => {
+  if (!req.account_id) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const row = await loadOwnedPendingReply(req.params.id, req.account_id);
+    if (!row) return res.status(404).json({ error: 'Not found' });
+    if (!row.sender_email) return res.status(409).json({ error: 'This client has no sender email address configured' });
+
+    const draftReply = (req.body?.draftReply ?? row.draft_reply) || '';
+
+    let sentMessageId = null;
+    try {
+      sentMessageId = await sendThreadedReply({
+        senderEmail: row.sender_email,
+        senderName: row.sender_name || row.client_name,
+        toEmail: row.from_email,
+        subject: row.subject?.startsWith('Re:') ? row.subject : `Re: ${row.subject}`,
+        bodyText: draftReply,
+        inReplyTo: row.in_reply_to,
+      });
+    } catch (sendErr) {
+      console.error('[action-queue] reply send failed:', sendErr.message);
+      return res.status(502).json({ error: `Could not send the reply: ${sendErr.message}` });
+    }
+
+    // Email is sent and irreversible from here; everything after this point is best-effort and
+    // reported back, never retried automatically (retrying could double-send).
+    const warnings = [];
+
+    if (row.proposed_resume_after) {
+      await pool.query(
+        `INSERT INTO chase_pause (client_id, bucket_key, status, resume_after)
+         VALUES ($1, $2, 'PAUSED_AGREED_DATE', $3)
+         ON CONFLICT (client_id, bucket_key)
+         DO UPDATE SET status = 'PAUSED_AGREED_DATE', resume_after = $3, updated_at = now()`,
+        [row.client_id, row.bucket_key, row.proposed_resume_after]
+      );
+    } else {
+      await pool.query('DELETE FROM chase_pause WHERE client_id = $1 AND bucket_key = $2', [row.client_id, row.bucket_key]);
+    }
+
+    if (row.intent === 'PROMISE_TO_PAY' && row.target_date) {
+      try {
+        const parsed = parseBucketKey(row.bucket_key);
+        const ctx = await getXeroContext(row.client_id);
+        const data = getXeroData();
+        const openInvoices = await data.getOpenInvoices(ctx, parsed.contactId);
+        for (const inv of openInvoices) {
+          await data.updateInvoiceExpectedPaymentDate(ctx, inv.id, row.target_date);
+        }
+      } catch (xeroErr) {
+        console.error('[action-queue] Xero ExpectedPaymentDate write failed:', xeroErr.message);
+        warnings.push(`The reply was sent, but updating Xero failed: ${xeroErr.message}`);
+      }
+    }
+
+    await pool.query(
+      `UPDATE inbound_reply SET status = 'APPROVED', decided_at = now(), sent_message_id = $2, draft_reply = $3 WHERE id = $1`,
+      [row.id, sentMessageId, draftReply]
+    );
+
+    res.json({ status: 'APPROVED', sentMessageId, warnings });
+  } catch (e) {
+    console.error('Action Queue approve error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/action-queue/:id/reject', resolveSession, async (req, res) => {
+  if (!req.account_id) return res.status(403).json({ error: 'Forbidden' });
+  try {
+    const row = await loadOwnedPendingReply(req.params.id, req.account_id);
+    if (!row) return res.status(404).json({ error: 'Not found' });
+
+    await pool.query('DELETE FROM chase_pause WHERE client_id = $1 AND bucket_key = $2', [row.client_id, row.bucket_key]);
+    await pool.query(`UPDATE inbound_reply SET status = 'REJECTED', decided_at = now() WHERE id = $1`, [row.id]);
+
+    res.json({ status: 'REJECTED' });
+  } catch (e) {
+    console.error('Action Queue reject error:', e);
+    res.status(500).json({ error: e.message });
   }
 });
 

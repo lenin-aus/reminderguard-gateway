@@ -9,6 +9,7 @@ const { buildStatementModel } = require('./statementModel');
 const { renderStatementHtml } = require('./statementHtml');
 const { renderTemplate, toSubject, bodyToHtml } = require('./statementTemplate');
 const { statementLockKey } = require('./statementOptions');
+const { replyToAddress } = require('./inboundReply');
 
 const GOTENBERG_URL = process.env.GOTENBERG_URL || 'http://gotenberg:3000';
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
@@ -45,13 +46,24 @@ function fmt(amount, currencyCode) {
   }
 }
 
-async function updateStatementLog(logId, status, errorMessage, errorReason) {
+async function updateStatementLog(logId, status, errorMessage, errorReason, sentMessageId) {
   await pool.query(
     `UPDATE statement_logs
-     SET status = $1, error_message = $2, error_reason = $3
+     SET status = $1, error_message = $2, error_reason = $3, sent_message_id = COALESCE($5, sent_message_id)
      WHERE id = $4`,
-    [status, errorMessage || null, errorReason || null, logId]
+    [status, errorMessage || null, errorReason || null, logId, sentMessageId || null]
   );
+}
+
+// Action Queue's authoritative guard: a row here, not yet resumed, means skip — regardless of what
+// Xero's own DueDate says. Checked before any Xero call, so a paused bucket costs nothing.
+async function chasePausedUntil(clientId, bucketKey) {
+  const { rows } = await pool.query(
+    `SELECT resume_after FROM chase_pause WHERE client_id = $1 AND bucket_key = $2
+       AND (resume_after IS NULL OR resume_after > now())`,
+    [clientId, bucketKey]
+  );
+  return rows.length > 0;
 }
 
 // A job that ends for a reason no retry can fix: the log row is marked FAILED with a stable
@@ -82,6 +94,11 @@ const worker = new Worker('auto-statements', async (job) => {
       const err = new Error(`LOCK_COLLISION: ${bucketKey} is locked by another active run.`);
       throw err;
     }
+  }
+
+  if (await chasePausedUntil(clientId, bucketKey)) {
+    console.log(`[Worker] Skipped ${bucketKey} — chasing paused (Action Queue)`);
+    return await skip(logId, lockKey, 'CHASE_PAUSED', 'Reminders are paused on this bucket pending an Action Queue review', 'SKIPPED_CHASE_PAUSED');
   }
 
   // live: read Xero. local: read the synced copy, after refreshing this one contact live (below).
@@ -187,7 +204,9 @@ const worker = new Worker('auto-statements', async (job) => {
       body: JSON.stringify({
         sender: { email: senderEmail, name: senderName },
         to: [{ email: contact.email }],
-        ...(options?.replyTo ? { replyTo: { email: options.replyTo } } : {}),
+        // An explicit per-send reply-to wins; otherwise default to the Action Queue token so a
+        // reply is caught, parsed and pauses chasing on this bucket (see inboundReply.js).
+        replyTo: { email: options?.replyTo || replyToAddress(clientId, bucketKey) },
         ...(options?.bcc ? { bcc: [{ email: options.bcc }] } : {}),
         subject,
         htmlContent,
@@ -207,12 +226,13 @@ const worker = new Worker('auto-statements', async (job) => {
       const err = new Error(`Brevo send failed: ${brevoRes.status} - ${errBody}`);
       throw err;
     }
+    const brevoBody = await brevoRes.json().catch(() => null);
 
     emailSent = true;
 
     try {
       await redis.set(lockKey, '1', 'KEEPTTL');
-      await updateStatementLog(logId, 'DELIVERED', null, null);
+      await updateStatementLog(logId, 'DELIVERED', null, null, brevoBody?.messageId);
     } catch (postSendErr) {
       console.error('[Worker] Post-send finalization failed, swallowing to prevent duplicate email retry', postSendErr);
     }
