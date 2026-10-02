@@ -1051,75 +1051,92 @@ async function sendThreadedReply({ senderEmail, senderName, toEmail, subject, bo
   return body?.messageId || null;
 }
 
+// One email from the real payload shape: { items: [ { To, From, Subject, MessageId, InReplyTo,
+// ExtractedMarkdownMessage, ... } ] } — confirmed against Brevo's own example 2026-10-02 (the
+// earlier "flat" assumption, taken from a doc summary rather than a real payload, silently dropped
+// every inbound reply; caught via Brevo's own inbound/events log showing webhookDelivered with
+// nothing landing here).
+async function processInboundItem(item) {
+  const toCandidates = Array.isArray(item?.To) ? item.To : [item?.To].filter(Boolean);
+  let token = null;
+  for (const to of toCandidates) {
+    token = parseReplyToken(to?.Address || to);
+    if (token) break;
+  }
+  if (!token) {
+    console.warn('[inbound-reply] no chase+ token found in To, dropping', JSON.stringify(toCandidates));
+    return;
+  }
+  const { clientId, bucketKey } = token;
+
+  const clientRow = await pool.query('SELECT id FROM client_config WHERE id = $1', [clientId]);
+  if (clientRow.rows.length === 0) {
+    console.warn(`[inbound-reply] token names client ${clientId}, which does not exist — dropping`);
+    return;
+  }
+
+  const messageId = item?.MessageId || item?.Headers?.['Message-Id'] || `missing-${Date.now()}-${Math.random()}`;
+
+  // Ghost protection: locked before classification, which can take a few seconds (the LLM
+  // fallback). A webhook retry (same MessageId) is harmless here — it just re-pends the review.
+  await pool.query(
+    `INSERT INTO chase_pause (client_id, bucket_key, status, resume_after)
+     VALUES ($1, $2, 'PAUSED_PENDING_REVIEW', NULL)
+     ON CONFLICT (client_id, bucket_key)
+     DO UPDATE SET status = 'PAUSED_PENDING_REVIEW', resume_after = NULL, updated_at = now()`,
+    [clientId, bucketKey]
+  );
+
+  const threadRow = await pool.query(
+    `SELECT sent_message_id FROM statement_logs
+      WHERE client_id = $1 AND bucket_key = $2 AND sent_message_id IS NOT NULL
+      ORDER BY created_at DESC LIMIT 1`,
+    [clientId, bucketKey]
+  );
+  const inReplyTo = threadRow.rows[0]?.sent_message_id || item?.InReplyTo || null;
+
+  const bodyText = item?.ExtractedMarkdownMessage || '';
+  const classification = await classifyReply(bodyText);
+  const proposedResumeAfter = resumeAfterFor(classification.targetDate);
+
+  await pool.query(
+    `INSERT INTO inbound_reply
+       (client_id, bucket_key, contact_name, from_email, subject, body_text, message_id, in_reply_to,
+        source, intent, confidence, target_date, draft_reply, proposed_resume_after)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+     ON CONFLICT (client_id, message_id) DO NOTHING`,
+    [
+      clientId, bucketKey, item?.From?.Name || '', item?.From?.Address || '',
+      item?.Subject || '', bodyText, messageId, inReplyTo,
+      classification.source, classification.intent, classification.confidence,
+      classification.targetDate, classification.draftReply, proposedResumeAfter,
+    ]
+  );
+}
+
 // Brevo's inbound webhook carries no signature to verify (checked against their docs 2026-10-02),
 // so the URL itself carries an unguessable secret as a second factor alongside the ownership check
-// below. A wrong or missing secret gets a plain 404, not a 401/403, so as not to confirm the path
+// above. A wrong or missing secret gets a plain 404, not a 401/403, so as not to confirm the path
 // shape to a scanner.
 app.post('/webhooks/inbound-reply/:secret', async (req, res) => {
   if (!INBOUND_WEBHOOK_SECRET || req.params.secret !== INBOUND_WEBHOOK_SECRET) return res.sendStatus(404);
 
   try {
-    const toCandidates = Array.isArray(req.body?.To) ? req.body.To : [req.body?.To].filter(Boolean);
-    let token = null;
-    for (const to of toCandidates) {
-      token = parseReplyToken(to?.Address || to);
-      if (token) break;
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    // Each item is independent: one bad/unmatched item (an unrelated reply, a malformed To) must
+    // not stop the rest of the batch from being processed.
+    for (const item of items) {
+      try {
+        await processInboundItem(item);
+      } catch (e) {
+        console.error('[inbound-reply] one item in the batch failed:', e);
+      }
     }
-    if (!token) {
-      console.warn('[inbound-reply] no chase+ token found in To, dropping', JSON.stringify(toCandidates));
-      return res.sendStatus(200);
-    }
-    const { clientId, bucketKey } = token;
-
-    const clientRow = await pool.query('SELECT id FROM client_config WHERE id = $1', [clientId]);
-    if (clientRow.rows.length === 0) {
-      console.warn(`[inbound-reply] token names client ${clientId}, which does not exist — dropping`);
-      return res.sendStatus(200);
-    }
-
-    const messageId = req.body?.MessageId || req.body?.Headers?.['Message-Id'] || `missing-${Date.now()}-${Math.random()}`;
-
-    // Ghost protection: locked before classification, which can take a few seconds (the LLM
-    // fallback). A webhook retry (same MessageId) is harmless here — it just re-pends the review.
-    await pool.query(
-      `INSERT INTO chase_pause (client_id, bucket_key, status, resume_after)
-       VALUES ($1, $2, 'PAUSED_PENDING_REVIEW', NULL)
-       ON CONFLICT (client_id, bucket_key)
-       DO UPDATE SET status = 'PAUSED_PENDING_REVIEW', resume_after = NULL, updated_at = now()`,
-      [clientId, bucketKey]
-    );
-
-    const threadRow = await pool.query(
-      `SELECT sent_message_id FROM statement_logs
-        WHERE client_id = $1 AND bucket_key = $2 AND sent_message_id IS NOT NULL
-        ORDER BY created_at DESC LIMIT 1`,
-      [clientId, bucketKey]
-    );
-    const inReplyTo = threadRow.rows[0]?.sent_message_id || req.body?.InReplyTo || null;
-
-    const bodyText = req.body?.ExtractedMarkdownMessage || '';
-    const classification = await classifyReply(bodyText);
-    const proposedResumeAfter = resumeAfterFor(classification.targetDate);
-
-    await pool.query(
-      `INSERT INTO inbound_reply
-         (client_id, bucket_key, contact_name, from_email, subject, body_text, message_id, in_reply_to,
-          source, intent, confidence, target_date, draft_reply, proposed_resume_after)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-       ON CONFLICT (client_id, message_id) DO NOTHING`,
-      [
-        clientId, bucketKey, req.body?.From?.Name || '', req.body?.From?.Address || '',
-        req.body?.Subject || '', bodyText, messageId, inReplyTo,
-        classification.source, classification.intent, classification.confidence,
-        classification.targetDate, classification.draftReply, proposedResumeAfter,
-      ]
-    );
-
     res.sendStatus(200);
   } catch (e) {
     console.error('[inbound-reply] webhook failed:', e);
-    // Still 200: the bucket is already paused (the insert above runs first), and Brevo would
-    // otherwise retry an email that may have partially succeeded.
+    // Still 200: any items already processed are already paused, and Brevo would otherwise retry
+    // a batch that may have partially succeeded.
     res.sendStatus(200);
   }
 });
