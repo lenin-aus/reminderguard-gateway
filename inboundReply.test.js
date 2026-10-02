@@ -67,6 +67,22 @@ test('classifyReply falls back to a safe OTHER result when the LLM is not config
   }
 });
 
+test('LLM_PROVIDER=ollama routes to Ollama, and an unreachable one falls back the same safe way', async () => {
+  const savedProvider = process.env.LLM_PROVIDER;
+  const savedUrl = process.env.OLLAMA_BASE_URL;
+  process.env.LLM_PROVIDER = 'ollama';
+  process.env.OLLAMA_BASE_URL = 'http://127.0.0.1:19191'; // nothing listens here
+  try {
+    const result = await classifyReply('We are disputing this invoice entirely.');
+    assert.deepEqual(result, { source: 'llm', intent: 'OTHER', confidence: 0, targetDate: null, draftReply: '' });
+  } finally {
+    if (savedProvider) process.env.LLM_PROVIDER = savedProvider;
+    else delete process.env.LLM_PROVIDER;
+    if (savedUrl) process.env.OLLAMA_BASE_URL = savedUrl;
+    else delete process.env.OLLAMA_BASE_URL;
+  }
+});
+
 test('classifyReply prefers the local regex match and never calls the LLM for a clean case', async () => {
   const ref = new Date('2026-10-01T00:00:00Z');
   const result = await classifyReply('We will pay by 16 Oct.', { referenceDate: ref });

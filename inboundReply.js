@@ -15,6 +15,15 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ANTHROPIC_API_URL = process.env.ANTHROPIC_API_URL || 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001';
 
+// Dev-only alternative to Anthropic: a model running on Ollama (free, local, nothing leaves the
+// machine), so Tier 2 can be exercised offline without an API key. Never used in production —
+// LLM_PROVIDER stays unset there. See dev/.env.example for how the local stack points this at the
+// host machine, not the gateway's own container. Read live (a function, like xeroContext.js's
+// usingFixtures()), not captured at require time, so a test can flip it without a module reload.
+const llmProvider = () => process.env.LLM_PROVIDER || 'anthropic';
+const ollamaBaseUrl = () => process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
+const ollamaModel = () => process.env.OLLAMA_MODEL || 'llama3.2';
+
 // chase+{clientId}+{bucketKey}@inbound.fasttrackledger.com — see migrations/006_action_queue.sql.
 function replyToAddress(clientId, bucketKey) {
   return `chase+${clientId}+${bucketKey}@${INBOUND_EMAIL_DOMAIN}`;
@@ -70,11 +79,22 @@ const LLM_SYSTEM_PROMPT = `You read a debtor's email reply to an overdue-invoice
 {"intent": "PROMISE_TO_PAY" | "DISPUTE" | "OTHER", "confidence": <0 to 1>, "targetDate": "YYYY-MM-DD" | null, "draftReply": "<a short, polite reply a bookkeeper could send as-is, or edit first>"}
 "targetDate" is only set when intent is PROMISE_TO_PAY and a specific date is clearly stated or inferable from context (e.g. "next Friday" relative to the email's date). If the reply disputes the amount, claims it's already paid, or is otherwise not a clean promise to pay, use DISPUTE or OTHER and leave targetDate null. Never invent a date that isn't supported by the text.`;
 
-// Returns null (not a thrown error) on any failure — missing key, network error, bad response — so
-// a broken or unconfigured LLM never loses an inbound reply. The caller still creates an
-// inbound_reply row either way; a null result just means source: 'llm', intent: 'OTHER',
-// confidence: 0, and an empty draft for the bookkeeper to fill in by hand.
-async function classifyWithLlm(bodyText, { referenceDate = new Date() } = {}) {
+// Shared by both providers: turns the model's raw JSON text into the normalized shape, or null if
+// it isn't usable (bad JSON, an intent outside the three allowed) — same "fail into manual review,
+// never lose the reply" contract either way.
+function parseLlmJson(text) {
+  const parsed = JSON.parse(text);
+  if (!['PROMISE_TO_PAY', 'DISPUTE', 'OTHER'].includes(parsed.intent)) return null;
+  return {
+    source: 'llm',
+    intent: parsed.intent,
+    confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0,
+    targetDate: parsed.intent === 'PROMISE_TO_PAY' ? parsed.targetDate || null : null,
+    draftReply: parsed.draftReply || '',
+  };
+}
+
+async function classifyWithAnthropic(bodyText, referenceDate) {
   if (!ANTHROPIC_API_KEY) {
     console.error('classifyWithLlm: ANTHROPIC_API_KEY is not set, leaving intent for manual review');
     return null;
@@ -101,20 +121,50 @@ async function classifyWithLlm(bodyText, { referenceDate = new Date() } = {}) {
       return null;
     }
     const data = await res.json();
-    const text = data?.content?.[0]?.text;
-    const parsed = JSON.parse(text);
-    if (!['PROMISE_TO_PAY', 'DISPUTE', 'OTHER'].includes(parsed.intent)) return null;
-    return {
-      source: 'llm',
-      intent: parsed.intent,
-      confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0,
-      targetDate: parsed.intent === 'PROMISE_TO_PAY' ? parsed.targetDate || null : null,
-      draftReply: parsed.draftReply || '',
-    };
+    return parseLlmJson(data?.content?.[0]?.text);
   } catch (e) {
     console.error('classifyWithLlm: failed', e.message);
     return null;
   }
+}
+
+// Ollama's own /api/chat, not the OpenAI-compatible route: format: 'json' makes it constrain
+// output to valid JSON, which a small local model otherwise gets wrong often enough to matter.
+async function classifyWithOllama(bodyText, referenceDate) {
+  const baseUrl = ollamaBaseUrl();
+  try {
+    const res = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: ollamaModel(),
+        stream: false,
+        format: 'json',
+        messages: [
+          { role: 'system', content: LLM_SYSTEM_PROMPT },
+          { role: 'user', content: `Today's date is ${referenceDate.toISOString().slice(0, 10)}.\n\nEmail reply:\n${bodyText}` },
+        ],
+      }),
+    });
+    if (!res.ok) {
+      console.error('classifyWithLlm: Ollama error', res.status, await res.text());
+      return null;
+    }
+    const data = await res.json();
+    return parseLlmJson(data?.message?.content);
+  } catch (e) {
+    console.error(`classifyWithLlm: failed (is Ollama running? OLLAMA_BASE_URL=${baseUrl})`, e.message);
+    return null;
+  }
+}
+
+// Returns null (not a thrown error) on any failure — missing key, network error, bad response — so
+// a broken or unconfigured LLM never loses an inbound reply. The caller still creates an
+// inbound_reply row either way; a null result just means source: 'llm', intent: 'OTHER',
+// confidence: 0, and an empty draft for the bookkeeper to fill in by hand.
+async function classifyWithLlm(bodyText, { referenceDate = new Date() } = {}) {
+  if (llmProvider() === 'ollama') return classifyWithOllama(bodyText, referenceDate);
+  return classifyWithAnthropic(bodyText, referenceDate);
 }
 
 async function classifyReply(bodyText, { referenceDate = new Date() } = {}) {
